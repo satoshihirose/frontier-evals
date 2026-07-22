@@ -116,7 +116,9 @@ class BasePBSolver(PythonCodingSolver, ABC):
 
         if num_tars == 0:
             ctx_logger.exception(
-                f"Expected BasicAgent to produce a tar for {task.run_id} (should always attempt to upload a tar at the end of the run), but found 0 tars",
+                f"Expected the solver to produce a tar for {task.run_id} "
+                "(it should always attempt to upload one at the end of the run), "
+                "but found 0 tars",
                 destinations=["group", "run"],
                 _print=True,
             )
@@ -170,7 +172,9 @@ class BasePBSolver(PythonCodingSolver, ABC):
             agent_output = await self._run_agent(computer, task)
 
             with bf.BlobFile(bf.join(task.run_dir, "metadata.json"), "w") as f:
-                json.dump(agent_output.model_dump(), f, indent=4)
+                metadata = agent_output.model_dump()
+                metadata["requirements_input"] = task.requirements_input_metadata()
+                json.dump(metadata, f, indent=4)
             await self._sanity_check_submission(task)
         except Exception as e:
             # we catch the exception and log it

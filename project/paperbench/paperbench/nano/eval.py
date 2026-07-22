@@ -9,6 +9,9 @@ from paperbench.constants import AGENT_DIR, LOGS_DIR, SUBMISSION_DIR
 
 load_dotenv()
 from nanoeval_alcatraz.alcatraz_computer_interface import AlcatrazComputerRuntime
+from preparedness_turn_completer.oai_completions_turn_completer import (
+    OpenAICompletionsTurnCompleter,
+)
 from typing_extensions import override
 
 import chz
@@ -29,6 +32,7 @@ from paperbench.nano.structs import (
 )
 from paperbench.nano.task import PBTask
 from paperbench.nano.utils import SPLIT_TO_EXPECTED_PAPERS, gather_eval_runs
+from paperbench.requirements import add_requirements_instruction, load_requirements_input
 from paperbench.utils import (
     create_run_dir,
     create_run_id,
@@ -48,6 +52,10 @@ GRADER_OPENAI_API_KEY = os.getenv("GRADER_OPENAI_API_KEY") or os.getenv("OPENAI_
 logger = structlog.stdlib.get_logger(component=__name__)
 
 
+def requires_grader_openai_api_key(completer_config: object) -> bool:
+    return isinstance(completer_config, OpenAICompletionsTurnCompleter.Config)
+
+
 @chz.chz
 class PaperBench(PythonCodingEval):
     reproduction: ReproductionConfig = chz.field(default_factory=ReproductionConfig)
@@ -55,9 +63,23 @@ class PaperBench(PythonCodingEval):
     monitor_config: Monitor.Config = chz.field(default_factory=BasicMonitor.Config)
 
     # task args
-    paper_split: Literal["debug", "dev", "human", "testing", "all"] = chz.field(
+    paper_split: Literal[
+        "debug",
+        "dev",
+        "human",
+        "testing",
+        "all",
+        "semantic-poc",
+        "bam-poc",
+        "bbox-poc",
+    ] = chz.field(
         default="all",
-        doc="Paper split to use. One of 'testing' (lca-on-the-line only), 'debug' (rice only), 'dev' (two papers), 'human' (papers used in human baseline), 'all' (full set)",
+        doc=(
+            "Paper split to use: 'testing' (lca-on-the-line only), 'debug' (rice only), "
+            "'dev' (two papers), 'human' (human-baseline papers), 'all' (full set), "
+            "'semantic-poc' (semantic-self-consistency only), 'bam-poc' (BaM only), or "
+            "'bbox-poc' (BBox-Adapter only)."
+        ),
         # should match what is in experiments/splits/
     )
     resume_run_group_id: str | None = chz.field(default=None)
@@ -72,6 +94,13 @@ class PaperBench(PythonCodingEval):
     save_cluster_output_to_host: bool = chz.field(
         default=False,
         doc="If true, save cluster output to host machine at the end of a run.",
+    )
+    requirements_csv: str | None = chz.field(
+        default=None,
+        doc=(
+            "Optional host path to a Requirements CSV supplied to the agent. "
+            "Leave unset for the PaperBench baseline condition."
+        ),
     )
 
     # other args
@@ -105,7 +134,10 @@ class PaperBench(PythonCodingEval):
     async def get_instances(self) -> list[PBTask]:
         """Tasks are papers * seeds, with the paper list from `self.paper_split` and seeds from `self.n_tries`."""
 
-        assert GRADER_OPENAI_API_KEY, "Environment variable `GRADER_OPENAI_API_KEY` is not set."
+        if requires_grader_openai_api_key(self.judge.completer_config):
+            assert GRADER_OPENAI_API_KEY, (
+                "Environment variable `GRADER_OPENAI_API_KEY` is not set."
+            )
 
         ctx_logger = logger.bind(run_group_id=self.run_group_id, runs_dir=self.runs_dir)
 
@@ -128,6 +160,15 @@ class PaperBench(PythonCodingEval):
             instructions = get_root() / "instructions" / "code_only_instructions.txt"
         else:
             instructions = get_root() / "instructions" / "instructions.txt"
+        requirements = (
+            load_requirements_input(self.requirements_csv)
+            if self.requirements_csv is not None
+            else None
+        )
+        task_instructions = add_requirements_instruction(
+            instructions.read_text(),
+            requirements_provided=requirements is not None,
+        )
 
         # populate tasks with all the run_ids
         tasks = []
@@ -154,7 +195,7 @@ class PaperBench(PythonCodingEval):
                     PBTask(
                         question_id=run_id,
                         attempt_id=attempt_idx,
-                        prompt=[{"role": "user", "content": instructions.read_text()}],
+                        prompt=[{"role": "user", "content": task_instructions}],
                         paper_id=paper_id,
                         run_id=run_id,
                         run_group_id=self.run_group_id,
@@ -165,6 +206,15 @@ class PaperBench(PythonCodingEval):
                         reproduction=self.reproduction,
                         monitor_config=self.monitor_config,
                         save_cluster_output_to_host=self.save_cluster_output_to_host,
+                        requirements_csv=(
+                            str(requirements.source_path) if requirements is not None else None
+                        ),
+                        requirements_csv_sha256=(
+                            requirements.sha256 if requirements is not None else None
+                        ),
+                        requirements_count=(
+                            requirements.requirement_count if requirements is not None else 0
+                        ),
                         network_mode=NetworkMode.UNPROXIED
                         if self.allow_internet
                         else NetworkMode.NONE,
@@ -205,6 +255,7 @@ class PaperBench(PythonCodingEval):
             for _, r in results
             if isinstance(r, FinalResult) and isinstance(r.grade, PaperBenchGrade)
         ]
+        requirements_task = tasks[0] if tasks and isinstance(tasks[0], PBTask) else None
 
         # params
         params = {
@@ -215,6 +266,19 @@ class PaperBench(PythonCodingEval):
             "code_only": self.judge.code_only,
             "resources_provided": self.judge.resources_provided,
             "agent": self.solver.shortname(),
+            "requirements_csv_provided": self.requirements_csv is not None,
+            "requirements_csv_sha256": (
+                requirements_task.requirements_csv_sha256
+                if requirements_task is not None
+                and requirements_task.requirements_csv is not None
+                else None
+            ),
+            "requirements_count": (
+                requirements_task.requirements_count
+                if requirements_task is not None
+                and requirements_task.requirements_csv is not None
+                else 0
+            ),
         }
 
         # health

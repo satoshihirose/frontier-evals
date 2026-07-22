@@ -45,10 +45,12 @@ def _get_leaf_node_token_usages(task: GradedTaskNode) -> list[TokenUsage]:
 
     if task.is_leaf():
         # need this check because judge_metadata may be malformed in case of node errors
-        if task.judge_metadata is not None and "token_usage" in task.judge_metadata:
-            return [TokenUsage.from_dict(task.judge_metadata["token_usage"])]
-        else:
+        if task.judge_metadata is None:
             return []
+        token_usage = task.judge_metadata.get("token_usage")
+        if not isinstance(token_usage, dict):
+            return []
+        return [TokenUsage.from_dict(token_usage)]
 
     token_usages = []
 

@@ -43,6 +43,11 @@ from paperbench.nano.structs import (
 from paperbench.nano.utils import get_file_at_duration
 from paperbench.paper_registry import paper_registry
 from paperbench.reproduce import reproduce_on_computer_with_salvaging
+from paperbench.requirements import (
+    REQUIREMENTS_CONTAINER_DIR,
+    REQUIREMENTS_CONTAINER_PATH,
+    load_requirements_input,
+)
 from paperbench.solvers.upload import (
     upload_heavy_logs,
     upload_status,
@@ -65,6 +70,9 @@ class PBTask(ComputerTask):
     judge: JudgeConfig
     monitor_config: Monitor.Config
     skipped_rollout: bool = False  # whether rollouts were skipped (e.g. if we're resuming)
+    requirements_csv: str | None = None
+    requirements_csv_sha256: str | None = None
+    requirements_count: int = 0
 
     save_cluster_output_to_host: bool
 
@@ -75,6 +83,25 @@ class PBTask(ComputerTask):
             " on the computer, though users may choose to use other network modes."
         ),
     )
+
+    async def _setup_requirements(self, computer: ComputerInterface) -> None:
+        if self.requirements_csv is None:
+            return
+
+        requirements = load_requirements_input(self.requirements_csv)
+        if requirements.sha256 != self.requirements_csv_sha256:
+            raise ValueError(
+                "Requirements CSV changed after the PaperBench task was created: "
+                f"{requirements.source_path}"
+            )
+        if requirements.requirement_count != self.requirements_count:
+            raise ValueError(
+                "Requirements CSV row count changed after the PaperBench task was created: "
+                f"{requirements.source_path}"
+            )
+        await computer.check_shell_command(f"mkdir -p {REQUIREMENTS_CONTAINER_DIR}")
+        await computer.upload(requirements.content, REQUIREMENTS_CONTAINER_PATH)
+        await computer.check_shell_command(f"chmod 0444 {REQUIREMENTS_CONTAINER_PATH}")
 
     @override
     async def _setup(self, computer: ComputerInterface, runtime_config: RuntimeConfig) -> None:
@@ -130,8 +157,19 @@ class PBTask(ComputerTask):
             with open(asset, "rb") as f:
                 await computer.upload(f.read(), f"{WORKSPACE_BASE}/paper/assets/{asset.name}")
 
+        await self._setup_requirements(computer)
+
         for dir in [SUBMISSION_DIR]:
             await computer.check_shell_command(f"mkdir -p {dir}")
+
+    def requirements_input_metadata(self) -> dict[str, object]:
+        provided = self.requirements_csv is not None
+        return {
+            "provided": provided,
+            "sha256": self.requirements_csv_sha256 if provided else None,
+            "requirement_count": self.requirements_count if provided else 0,
+            "container_path": REQUIREMENTS_CONTAINER_PATH if provided else None,
+        }
 
     async def _ensure_files_available_for_grading(self, computer: ComputerInterface) -> None:
         ctx_logger = logger.bind(

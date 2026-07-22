@@ -25,6 +25,13 @@ from paperbench.utils import get_timestamp
 logger = structlog.stdlib.get_logger(component=__name__)
 
 
+def get_completer_backend(config: TurnCompleter.Config | None) -> str | None:
+    if config is None:
+        return None
+    config_type = type(config)
+    return f"{config_type.__module__}:{config_type.__qualname__}"
+
+
 @dataclass(frozen=True)
 class JudgeOutput:
     judge_type: str
@@ -47,6 +54,7 @@ class JudgeOutput:
             "completer_config": self.completer_config.model_dump(mode="json")
             if self.completer_config
             else None,
+            "completer_backend": get_completer_backend(self.completer_config),
             "token_usage": self.token_usage.to_dict() if self.token_usage else None,
         }
 

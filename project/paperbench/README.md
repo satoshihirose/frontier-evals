@@ -87,7 +87,7 @@ source .env
 
 ### Agent resources
 
-Some papers require access to the OpenAI API and HuggingFace in order to be fully replicated. To make these API keys available to the agent, first copy `paperbench/solvers/agent.env.example` to `paperbench/solvers/agent.env` and populate the `OPENAI_API_KEY` and `HF_TOKEN` fields. The `agent.env` is provided in the agent's workspace and the agent is informed of this file in our [default instructions for BasicAgent](paperbench/solvers/aisi-basic-agent/templates.py), but `agent.env` is not sourced automatically on behalf of the agent.
+Some papers require access to the OpenAI API and HuggingFace in order to be fully replicated. To make these API keys available to the agent, first copy `paperbench/solvers/agent.env.example` to `paperbench/solvers/agent.env` and populate the `OPENAI_API_KEY` and `HF_TOKEN` fields. This is a local secrets file and is ignored by Git. Values must be written literally in `KEY=value` format; the current loader does not expand shell references such as `OPENAI_API_KEY=${OPENAI_API_KEY}`. The `agent.env` is provided in the agent's workspace and the agent is informed of this file in our [default instructions for BasicAgent](paperbench/solvers/aisi-basic-agent/templates.py), but `agent.env` is not sourced automatically on behalf of the agent. During reproduction, PaperBench reads this same local file and sets its entries as environment variables in the separate reproduction container.
 
 The HuggingFace token can be obtained through the website after making an account, and should have authorization to access [Llama-2](https://huggingface.co/meta-llama/Llama-2-7b) and [ImageNet](https://huggingface.co/datasets/ILSVRC/imagenet-1k).
 
@@ -111,12 +111,14 @@ Running agents with nanoeval and alcatraz requires Docker, which you can install
 PaperBench requires the following Docker images to be built before it can run:
 
 - [paperbench/Dockerfile.base](paperbench/Dockerfile.base): The base environment for agents which contains basic packages like `curl`, `git`, `python`, etc. and a Conda environment that can be used to run the agents. We re-use this docker image if users request grading to occur on a computer with `paperbench.judge.grade_locally=false`
+- [paperbench/solvers/codex/Dockerfile.agent](paperbench/solvers/codex/Dockerfile.agent): The `pb-env` image extended with a pinned Codex CLI for CodexSolver rollouts.
 - [paperbench/reproducer.Dockerfile](paperbench/reproducer.Dockerfile): The environment in which the submission is reproduced.
 
 We provide the following agents out-of-the-box:
 
 - [paperbench/solvers/dummy/solver.py](paperbench/solvers/dummy/solver.py): A agent for that creates a dummy submission, useful for testing the eval end-to-end.
 - [paperbench/solvers/basicagent/solver.py](paperbench/solvers/basicagent/solver.py): Simple ReAct style agents with tools available to them.
+- [paperbench/solvers/codex/solver.py](paperbench/solvers/codex/solver.py): A solver that runs Codex CLI non-interactively inside the PaperBench agent container.
 
 For convenience, we've provided a [script](paperbench/scripts/build-docker-images.sh) that builds all the above images:
 
@@ -172,6 +174,161 @@ uv run python -m paperbench.nano.entrypoint \
 - **Note** that we set the default concurrency to 5, you may want to adjust this based on your setup. To set the concurrency, simply specify `runner.concurrency=<int>` in the command.
 - **Note** By default, our solvers use the `AlcatrazComputerRuntime` for the `ComputerRuntime`. You may choose to use your own custom computer runtime. Simply point to it via `paperbench.solver.computer_runtime`, and then configure it appropriately. We recommend looking at the `BasePBSolver` implementation for guidance.
 - **Note** You may use a custom solver: set `paperbench.solver` to point to your custom solver class. This solver should be a `PythonCodingSolver` class. We recommend inheriting from `BasePBSolver` for convenience.
+
+### Codex CLI on semantic-self-consistency
+
+`semantic-poc` contains only the `semantic-self-consistency` development paper. The Codex
+agent image pins the CLI version at build time, while the solver records the actual version,
+model, reasoning effort, reasoning-summary setting, wall-clock runtime, exit status, and raw
+JSONL events for each run. The solver requests `detailed` public reasoning summaries by default;
+when the selected model emits them, they appear as reasoning items in `agent.log`. These are
+model-provided summaries, not the model's private chain-of-thought.
+The JSONL event stream is saved as PaperBench's `agent.log`, so the standard blacklist monitor
+runs before reproduction and grading. While Codex is running, the solver saves the current
+submission and logs every 30 minutes; the solver also saves a final checkpoint as soon as Codex
+exits, before PaperBench validates and grades the submission.
+At each checkpoint, the solver also derives `url-observations.jsonl` from the raw event stream.
+Each record identifies a redacted URL exposed by a Codex `web_search` event or by the command
+text of a `command_execution` event. Repeated started/completed events for the same item are
+consolidated. Embedded credentials and query parameters whose names indicate authentication,
+keys, passwords, secrets, signatures, or tokens are replaced with `REDACTED`. A
+`command_text` record means that a URL appeared in a command; it does not by itself prove that
+the command successfully connected to that URL. Network requests made internally by package
+managers or libraries remain outside this file unless Codex exposes their URLs in an event.
+Only the Codex CLI is added to the agent image. The Python solver and split remain in the host
+checkout, where PaperBench loads them and controls the container lifecycle. Because Codex uses
+shell commands directly, `CodexSolver` defaults to PaperBench's shell-only Alcatraz runtime.
+Before `codex exec` starts, the solver passes the unchanged non-iterative BasicAgent system
+message selected for the current `code_only` setting through Codex's `developer_instructions`
+configuration. The user input contains only the normal PaperBench task instructions and the
+exact time budget, detected GPU availability, `agent.env` location, and root access formatted
+with BasicAgent's existing runtime templates. It does not add Codex-specific completeness,
+baseline-prioritization, or coverage-audit instructions. The solver runs the same Docker sanity
+checks as BasicAgent and records the detected GPU and instruction mode in
+`codex-rollout.json`.
+
+Codex authentication is deliberately separate from the paper's API access. Run `codex login`
+with ChatGPT on the host first. `CodexSolver` mounts the resulting
+`~/.codex/auth.json` read-only at `/home/.codex/auth.json` in the agent container, verifies that
+`codex login status` reports ChatGPT authentication, and removes `OPENAI_API_KEY` from the
+`codex exec` process environment. The auth file is outside `/home/submission` and `/home/logs`,
+so PaperBench does not include it in submission snapshots. If Codex stores credentials only in
+the OS keychain, configure its credential store as `file` and sign in again before this run.
+
+The target paper still requires OpenAI API access when the generated reproduction code calls
+`gpt-3.5-turbo` and `gpt-4o-mini`. Put the literal key only in the Git-ignored local file
+`paperbench/solvers/agent.env`:
+
+```dotenv
+OPENAI_API_KEY=your-project-scoped-api-key
+```
+
+The agent may explicitly source `/home/agent.env` when testing paper code; the separate
+reproduction container receives the same value as an environment variable automatically.
+PaperBench excludes its data directory from Git LFS downloads by default, so fetch this task
+explicitly. Then build all three local images and run:
+
+```bash
+git -c lfs.fetchexclude= lfs pull \
+    --include='project/paperbench/data/papers/semantic-self-consistency/**'
+
+bash paperbench/scripts/build-docker-images.sh
+
+uv run python -m paperbench.nano.entrypoint \
+    paperbench.paper_split=semantic-poc \
+    paperbench.docker_image=pb-codex-env:latest \
+    paperbench.solver=paperbench.solvers.codex.solver:CodexSolver \
+    paperbench.solver.codex_auth_file='~/.codex/auth.json' \
+    paperbench.solver.model='gpt-5.6-sol' \
+    paperbench.solver.reasoning_effort=high \
+    paperbench.solver.reasoning_summary=detailed \
+    paperbench.solver.time_limit=86400 \
+    paperbench.solver.upload_interval_seconds=1800 \
+    paperbench.solver.computer_runtime.env=alcatraz.clusters.local:LocalConfig \
+    paperbench.solver.computer_runtime.env.pull_from_registry=false \
+    paperbench.reproduction.computer_runtime=nanoeval_alcatraz.alcatraz_computer_interface:AlcatrazComputerRuntime \
+    paperbench.reproduction.computer_runtime.env=alcatraz.clusters.local:LocalConfig \
+    paperbench.reproduction.computer_runtime.env.pull_from_registry=false \
+    paperbench.reproduction.timeout=86400 \
+    runner.max_retries=0 \
+    runner.concurrency=1 \
+    runner.recorder=nanoeval.json_recorder:json_recorder
+```
+
+This Semantic Self-Consistency task excludes the local Llama and Mistral experiments. Its
+required language-model generations use the OpenAI API, while SciBERT and RoBERTa-base
+featurization can run on CPU. The command above therefore uses CPU reproduction on a Mac;
+measure a bounded preflight before committing to the full API generation workload.
+
+For an initial code-only smoke test, add `paperbench.judge.code_only=True`. The solver still
+runs inside PaperBench, so rollout time, logs, blacklist monitoring, and submission capture
+retain their normal benchmark meaning.
+
+#### Supplying reproduction Requirements
+
+PaperBench can optionally provide a generated Requirements CSV as an additional agent input.
+This is an execution condition, not a judge setting. The paper, addendum, rubric, solver,
+network access, time limit, and judge remain unchanged.
+
+For the baseline condition, omit `paperbench.requirements_csv`. To run the same task with
+Requirements, add the host path to the existing command:
+
+```bash
+paperbench.requirements_csv='/absolute/path/to/requirements.csv'
+```
+
+PaperBench validates that the CSV contains `requirement_id`, `requirement_statement`, and
+`procedure_category`, then copies the exact file to
+`/home/requirements/requirements.csv` in the agent container and marks it read-only. The task
+instructions tell the agent to read each `requirement_statement`. When the option is omitted,
+PaperBench does not create the Requirements directory and does not change the instructions.
+The Docker image does not need to be rebuilt when the CSV changes.
+
+Each run's `metadata.json` records whether Requirements were provided, their row count, their
+SHA-256, and the container path. The run-group summary records the same condition without
+embedding the machine-specific host path. Use a new run group when changing this condition;
+resuming a rollout created under another input condition would not be a valid comparison.
+
+#### Switching the judge backend
+
+Keep the rollout, submission, rubric, and `SimpleJudge` unchanged, and select only the
+`TurnCompleter` backend. For development grading with the ChatGPT-authenticated Codex CLI, add:
+
+```bash
+paperbench.judge.completer_config=paperbench.judge.codex_cli_turn_completer:CodexCliTurnCompleter.Config \
+paperbench.judge.completer_config.model='gpt-5.4' \
+paperbench.judge.completer_config.codex_home='~/.codex' \
+paperbench.judge.completer_config.reasoning_effort=high \
+paperbench.judge.completer_config.max_concurrency=4
+```
+
+`gpt-5.4` is the oldest non-Spark general-purpose reasoning model currently exposed by the
+ChatGPT-authenticated Codex CLI. It is still substantially newer than the canonical
+`o3-mini-2025-01-31` judge, so it is only a development proxy. The `high` reasoning setting
+matches PaperBench's canonical main judge setting. The CLI backend
+serializes the existing Judge conversation and adds only a request to respond as its assistant
+without using tools. It otherwise leaves the Judge messages unchanged. The backend
+copies only `auth.json` into a private temporary `CODEX_HOME`, verifies that
+`codex login status` reports ChatGPT authentication, removes `OPENAI_API_KEY` and
+`GRADER_OPENAI_API_KEY` from every Codex process, and deletes the temporary home after each
+call. It applies the same backend to both the main judge call and the structured score-parsing
+calls. It does not require `GRADER_OPENAI_API_KEY`. It uses the ChatGPT plan's Codex allowance
+and may stop when that allowance is exhausted.
+
+For the final PaperBench-comparable grade, replace the CLI fields above with the canonical API
+completer and provide `GRADER_OPENAI_API_KEY`:
+
+```bash
+paperbench.judge.completer_config=preparedness_turn_completer.oai_completions_turn_completer:OpenAICompletionsTurnCompleter.Config \
+paperbench.judge.completer_config.model='o3-mini-2025-01-31' \
+paperbench.judge.completer_config.reasoning_effort=high
+```
+
+`grader_output.json` records the exact completer class in `completer_backend` and its settings
+in `completer_config`. Treat a CLI grade as a development measurement: model snapshots and the
+Codex execution layer differ from the canonical API judge. Report the API grade as the final
+PaperBench score, and compare CLI/API leaf decisions separately when evaluating the cheaper
+development judge.
 
 ### Canonical command
 
@@ -245,8 +402,10 @@ In each run group directory, there is a `group.log` file that contains the logs 
 
 In each run directory there is:
 - `agent.log`: (optional) Rollout log from the solver. If present, the monitoring step will run and the run's grade will be marked with `"monitor_ran": true`.
+- `url-observations.jsonl`: (CodexSolver only) Redacted URLs exposed by Codex web-search events or written in shell command text, with the source event and item ID.
 - `grade.json`: The grading result for that run.
-- `metadata.json`: Metadata for that run.
+- `metadata.json`: Metadata for that run, including the Requirements input condition and
+  content hash when applicable.
 - `run.log`: The log for that run.
 - `status.json`: The status of that run.
 - A submissions directory, containing multiple timestamped submission directories (e.g., `2025-03-28T10-34-35-UTC`), each with:

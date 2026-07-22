@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TypeAlias
+from typing import Any, TypeAlias, cast
 
 import openai
 import structlog.stdlib
@@ -39,6 +39,33 @@ from paperbench.rubric.tasks import TASK_CATEGORY_QUESTIONS, TaskNode
 logger = structlog.stdlib.get_logger(component=__name__)
 
 FileTree: TypeAlias = dict[str, "FileTree"]
+
+
+def normalize_selected_file_paths(
+    selected_files: str,
+    available_relative_paths: list[Path],
+    max_files: int | None,
+) -> list[Path]:
+    normalized: list[Path] = []
+    seen: set[Path] = set()
+    for line in selected_files.splitlines():
+        raw_path = line.strip().strip("`").lstrip("-* ").strip()
+        if not raw_path:
+            continue
+        raw_posix = Path(raw_path).as_posix()
+        matches = [
+            path
+            for path in available_relative_paths
+            if raw_posix == path.as_posix()
+            or raw_posix.endswith("/" + path.as_posix())
+        ]
+        if len(matches) != 1 or matches[0] in seen:
+            continue
+        normalized.append(matches[0])
+        seen.add(matches[0])
+        if max_files is not None and len(normalized) >= max_files:
+            break
+    return normalized
 
 
 class ParsedJudgeResponseFloat(BaseModel):
@@ -111,7 +138,9 @@ class SimpleJudge(Judge):
         self.prompt = build_judge_task_prompt(code_only)
         self.buffer_tokens = buffer_tokens
         self.joined_addendum = f"{self.addendum if self.addendum else ''}\n{self.judge_addendum if self.judge_addendum else ''}".strip()
-        self.leaf_semaphore = asyncio.Semaphore(100)
+        self.leaf_semaphore = asyncio.Semaphore(
+            getattr(self.completer, "max_concurrency", 100)
+        )
         self.max_prior_nodes = max_prior_nodes
         if self.joined_addendum == "":
             self.joined_addendum = "(NO ADDENDUM GIVEN)"
@@ -126,10 +155,19 @@ class SimpleJudge(Judge):
         If `config` is not provided,
         we fallback to a default OpenAICompletionsStructuredCompleter config
         """
-        cfg = config or OpenAICompletionsTurnCompleter.Config(
-            model="gpt-4o-2024-08-06",
-            response_format=response_format,
-        )
+        if config is not None:
+            cfg: TurnCompleter.Config = config
+        else:
+            with_response_format = getattr(
+                self.completer_config, "with_response_format", None
+            )
+            if callable(with_response_format):
+                cfg = cast(Any, with_response_format)(response_format)
+            else:
+                cfg = OpenAICompletionsTurnCompleter.Config(
+                    model="gpt-4o-2024-08-06",
+                    response_format=response_format,
+                )
         return cfg, cfg.build()
 
     async def process_file_content(self) -> None:
@@ -415,6 +453,21 @@ class SimpleJudge(Judge):
         if selected_files is None:
             raise Exception("No response received from completer for file selection")
         leaf_logger.info(f"Model file selection raw output:\n{selected_files}")
+        available_files = await self._get_whitelisted_files(
+            task.task_category or "Subtree"
+        )
+        available_relative_paths = [
+            path.relative_to(self.submission_dir) for path in available_files
+        ]
+        selected_relative_paths = normalize_selected_file_paths(
+            selected_files,
+            available_relative_paths,
+            max_files,
+        )
+        leaf_logger.info(
+            "Normalized selected files:\n"
+            + "\n".join(path.as_posix() for path in selected_relative_paths)
+        )
 
         selected_files_tokens = []
         num_files = 0
@@ -425,18 +478,18 @@ class SimpleJudge(Judge):
 
         file_content_tasks = [
             read_file_content(
-                self.submission_dir / rel_path.strip().strip("/"),
+                self.submission_dir / rel_path,
                 self.computer,
             )
-            for rel_path in selected_files.split("\n")[: max_files or None]
+            for rel_path in selected_relative_paths
         ]
 
         file_contents: list[str | BaseException] = await asyncio.gather(
             *file_content_tasks, return_exceptions=True
         )
 
-        for rel_path, content in zip(selected_files.split("\n"), file_contents):
-            full_path = self.submission_dir / rel_path.strip()
+        for rel_path, content in zip(selected_relative_paths, file_contents):
+            full_path = self.submission_dir / rel_path
             try:
                 if isinstance(content, BaseException):
                     raise content
