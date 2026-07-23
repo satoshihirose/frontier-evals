@@ -289,6 +289,41 @@ SHA-256, and the container path. The run-group summary records the same conditio
 embedding the machine-specific host path. Use a new run group when changing this condition;
 resuming a rollout created under another input condition would not be a valid comparison.
 
+#### Running BBox-Adapter on roemia with experiment data under `/data`
+
+Keep the `frontier-evals` checkout under `/data/$USER` on roemia. The
+[`run-bbox-roemia.sh`](paperbench/scripts/run-bbox-roemia.sh) launcher runs the full BBox-Adapter
+task with the existing PaperBench and Alcatraz volume settings; it does not change PaperBench's
+task logic. Docker images remain in Docker's configured data root, while host run artifacts are
+written to `/data/$USER/paperbench/runs`. The launcher bind-mounts
+`/data/$USER/paperbench/cache` at `/root/.cache` in both the Codex agent and reproduction
+containers, and uses separate `/data`-backed `/tmp` directories for the two stages. This keeps
+Hugging Face, Torch, pip, dataset, and temporary downloads out of Docker's writable layers.
+
+After building `pb-env`, `pb-codex-env`, and `pb-reproducer`, inspect the command without
+starting a run:
+
+```bash
+paperbench/scripts/run-bbox-roemia.sh --dry-run
+```
+
+Run the baseline condition without a Requirements CSV:
+
+```bash
+paperbench/scripts/run-bbox-roemia.sh
+```
+
+Run the Requirements condition by naming the exact CSV explicitly:
+
+```bash
+paperbench/scripts/run-bbox-roemia.sh \
+    --requirements-csv /absolute/path/to/requirements.csv
+```
+
+Override `PAPERBENCH_DATA_ROOT` only when another `/data` location is required. The launcher
+rejects non-`/data` roots during a real run. `--dry-run` allows a temporary root so the storage
+configuration can be tested without a GPU server.
+
 #### Switching the judge backend
 
 Keep the rollout, submission, rubric, and `SimpleJudge` unchanged, and select only the
