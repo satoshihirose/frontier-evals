@@ -1,5 +1,5 @@
 import os
-from typing import Any, Literal, Sequence
+from typing import Any, Sequence
 
 import blobfile as bf
 import structlog.stdlib
@@ -31,13 +31,12 @@ from paperbench.nano.structs import (
     ReproductionConfig,
 )
 from paperbench.nano.task import PBTask
-from paperbench.nano.utils import SPLIT_TO_EXPECTED_PAPERS, gather_eval_runs
+from paperbench.nano.utils import gather_eval_runs, load_paper_split
 from paperbench.requirements import add_requirements_instruction, load_requirements_input
 from paperbench.utils import (
     create_run_dir,
     create_run_id,
     get_default_runs_dir,
-    get_experiments_dir,
     get_paperbench_data_dir,
     get_root,
     get_timestamp,
@@ -63,24 +62,12 @@ class PaperBench(PythonCodingEval):
     monitor_config: Monitor.Config = chz.field(default_factory=BasicMonitor.Config)
 
     # task args
-    paper_split: Literal[
-        "debug",
-        "dev",
-        "human",
-        "testing",
-        "all",
-        "semantic-poc",
-        "bam-poc",
-        "bbox-poc",
-    ] = chz.field(
+    paper_split: str = chz.field(
         default="all",
         doc=(
-            "Paper split to use: 'testing' (lca-on-the-line only), 'debug' (rice only), "
-            "'dev' (two papers), 'human' (human-baseline papers), 'all' (full set), "
-            "'semantic-poc' (semantic-self-consistency only), 'bam-poc' (BaM only), or "
-            "'bbox-poc' (BBox-Adapter only)."
+            "Name of a text file in experiments/splits, without the '.txt' suffix. "
+            "Each non-empty line in that file is a PaperBench paper ID."
         ),
-        # should match what is in experiments/splits/
     )
     resume_run_group_id: str | None = chz.field(default=None)
     resume_no_extend: bool = chz.field(
@@ -148,9 +135,7 @@ class PaperBench(PythonCodingEval):
             _print=True,
         )
 
-        paper_split_path = get_experiments_dir() / "splits" / f"{self.paper_split}.txt"
-        with open(paper_split_path, "r") as f:
-            paper_ids = [line.strip() for line in f.read().splitlines() if line.strip()]
+        paper_ids = load_paper_split(self.paper_split)
 
         existing_run_ids = set()
         if self.resume_run_group_id is not None:
@@ -296,7 +281,7 @@ class PaperBench(PythonCodingEval):
         }
 
         eval_runs = gather_eval_runs(results_clean, self.n_tries)
-        expected_papers = SPLIT_TO_EXPECTED_PAPERS[self.paper_split]
+        expected_papers = len(load_paper_split(self.paper_split))
         overall_results = compute_agg_stats(eval_runs, expected_papers=expected_papers)
         mean_score_by_paper = per_paper_results(eval_runs, self.n_tries)
 
@@ -411,9 +396,7 @@ class PaperBench(PythonCodingEval):
         """
 
         papers_dir = get_paperbench_data_dir() / "papers"
-        split_path = get_experiments_dir() / "splits" / f"{self.paper_split}.txt"
-
-        paper_ids = [line.strip() for line in split_path.read_text().splitlines() if line.strip()]
+        paper_ids = load_paper_split(self.paper_split)
 
         for paper_id in paper_ids:
             paper_path = papers_dir / paper_id / "paper.md"

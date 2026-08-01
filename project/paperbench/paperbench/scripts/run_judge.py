@@ -7,7 +7,7 @@ import structlog.stdlib
 from preparedness_turn_completer.turn_completer import TurnCompleter
 
 import chz
-from paperbench.grade import JudgeOutput, run_judge
+from paperbench.grade import JudgeOutput, hash_submission_tree, run_judge
 from paperbench.judge.token_usage import get_total_token_usage
 from paperbench.utils import get_timestamp
 
@@ -32,6 +32,13 @@ class RunJudgeCliArgs:
         default=False,
         doc="Set to True to weight 'Dataset and Model Acquisition' nodes to 0.",
     )
+    leaf_checkpoint_path: Path | None = chz.field(
+        default=None,
+        doc=(
+            "Append successfully graded leaves to this JSONL file and reuse "
+            "compatible records when the command is restarted."
+        ),
+    )
     completer_config: TurnCompleter.Config | None = chz.field(
         default=None,
         doc=(
@@ -51,7 +58,15 @@ async def main(
     code_only: bool,
     completer_config: TurnCompleter.Config | None = None,
     resources_provided: bool = False,
+    leaf_checkpoint_path: Path | None = None,
 ) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    submission_fingerprint = None
+    if leaf_checkpoint_path is not None:
+        submission_fingerprint = await asyncio.to_thread(
+            hash_submission_tree, submission_path
+        )
+
     # Judge the submission
     graded_task_tree = await run_judge(
         submission_path=submission_path,
@@ -62,6 +77,10 @@ async def main(
         max_depth=max_depth,
         code_only=code_only,
         resources_provided=resources_provided,
+        leaf_checkpoint_path=(
+            str(leaf_checkpoint_path) if leaf_checkpoint_path is not None else None
+        ),
+        submission_fingerprint=submission_fingerprint,
     )
 
     token_usage = None
@@ -110,6 +129,7 @@ async def _main_from_cli(args: RunJudgeCliArgs) -> None:
         code_only=args.code_only,
         completer_config=completer_config,
         resources_provided=args.resources_provided,
+        leaf_checkpoint_path=args.leaf_checkpoint_path,
     )
 
 

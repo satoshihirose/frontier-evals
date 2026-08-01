@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import shlex
+import tempfile
 import time
 from pathlib import Path
 from typing import Literal
@@ -15,7 +17,6 @@ from nanoeval_alcatraz.alcatraz_computer_interface import AlcatrazComputerRuntim
 from typing_extensions import override
 
 import chz
-from alcatraz.clusters.local import VolumesConfig
 from nanoeval.solvers.computer_tasks.code_execution_interface import (
     ComputerInterface,
     ExecutionResult,
@@ -42,6 +43,8 @@ CODEX_ROLLOUT_METADATA = f"{LOGS_DIR}/codex-rollout.json"
 URL_OBSERVATIONS_FILENAME = "url-observations.jsonl"
 CODEX_HOME = f"{WORKSPACE_BASE}/.codex"
 CODEX_AUTH_PATH = f"{CODEX_HOME}/auth.json"
+CODEX_HOME_PREPARE_COMMAND = f"install -d -m 700 {CODEX_HOME}"
+CODEX_AUTH_CHMOD_COMMAND = f"chmod 600 {CODEX_AUTH_PATH}"
 CODEX_AUTH_STATUS_COMMAND = f"env -u OPENAI_API_KEY CODEX_HOME={CODEX_HOME} codex login status"
 INSTRUCTIONS_PATH = f"{WORKSPACE_BASE}/instructions.txt"
 ReasoningEffort = Literal["none", "low", "medium", "high", "xhigh", "max"]
@@ -232,7 +235,14 @@ class CodexSolver(BasePBSolver):
     )
     codex_auth_file: str = chz.field(
         default="~/.codex/auth.json",
-        doc="Host ChatGPT auth file mounted read-only into the Codex agent container",
+        doc="Host ChatGPT auth file copied into the isolated Codex agent container",
+    )
+    persist_refreshed_auth: bool = chz.field(
+        default=False,
+        doc=(
+            "Atomically copy the container's refreshed auth state back to codex_auth_file. "
+            "Use only with a run-specific auth copy, never the host's primary auth file."
+        ),
     )
     time_limit: int = chz.field(default=24 * 60 * 60, doc="Rollout time limit in seconds")
     upload_interval_seconds: float | None = chz.field(
@@ -250,19 +260,34 @@ class CodexSolver(BasePBSolver):
         auth_file = Path(self.codex_auth_file).expanduser().resolve()
         if not auth_file.is_file():
             raise FileNotFoundError(f"Codex ChatGPT auth file not found: {auth_file}")
-
-        volumes_config = VolumesConfig()
-        volumes_config["codexauth"] = {
-            "bind_source": str(auth_file),
-            "bind_dest": CODEX_AUTH_PATH,
-            "mode": "ro",
-        }
-        task.volumes_config = {**(task.volumes_config or {}), **volumes_config}
         return task
 
     @override
     async def _setup_computer(self, computer: ComputerInterface, task: PBTask) -> None:
         del task
+        auth_file = Path(self.codex_auth_file).expanduser().resolve()
+        auth_bytes = auth_file.read_bytes()
+        try:
+            parsed_auth = json.loads(auth_bytes)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Codex ChatGPT auth file is invalid JSON: {auth_file}") from exc
+        if not isinstance(parsed_auth, dict):
+            raise ValueError(f"Codex ChatGPT auth file must contain a JSON object: {auth_file}")
+
+        prepare_home = await computer.send_shell_command(
+            CODEX_HOME_PREPARE_COMMAND,
+            idempotent=True,
+        )
+        if prepare_home.exit_code != 0:
+            raise RuntimeError("Could not prepare the isolated Codex home directory")
+        await computer.upload(auth_bytes, CODEX_AUTH_PATH)
+        protect_auth = await computer.send_shell_command(
+            CODEX_AUTH_CHMOD_COMMAND,
+            idempotent=True,
+        )
+        if protect_auth.exit_code != 0:
+            raise RuntimeError("Could not protect the isolated Codex authentication file")
+
         result = await computer.send_shell_command("codex --version", idempotent=True)
         if result.exit_code != 0:
             raise RuntimeError(
@@ -279,8 +304,39 @@ class CodexSolver(BasePBSolver):
         if auth_status.exit_code != 0 or "chatgpt" not in auth_output.lower():
             raise RuntimeError(
                 "Codex ChatGPT subscription authentication is unavailable in the agent "
-                "container; the mounted auth file must come from `codex login` with ChatGPT"
+                "container; the copied auth file must come from `codex login` with ChatGPT"
             )
+
+    async def _persist_refreshed_auth(self, computer: ComputerInterface) -> None:
+        if not self.persist_refreshed_auth:
+            return
+
+        refreshed_auth = await computer.download(CODEX_AUTH_PATH)
+        try:
+            parsed_auth = json.loads(refreshed_auth)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Codex returned an invalid refreshed authentication file") from exc
+        if not isinstance(parsed_auth, dict):
+            raise ValueError("Codex refreshed authentication must contain a JSON object")
+
+        auth_file = Path(self.codex_auth_file).expanduser().resolve()
+        auth_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        file_descriptor, temporary_path = tempfile.mkstemp(
+            dir=auth_file.parent,
+            prefix=".auth.json.",
+            suffix=".tmp",
+        )
+        try:
+            os.write(file_descriptor, refreshed_auth)
+            os.fchmod(file_descriptor, 0o600)
+            os.close(file_descriptor)
+            file_descriptor = -1
+            os.replace(temporary_path, auth_file)
+        finally:
+            if file_descriptor >= 0:
+                os.close(file_descriptor)
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
 
     async def _read_event_log(self, computer: ComputerInterface, fallback: bytes) -> bytes:
         try:
@@ -406,6 +462,12 @@ class CodexSolver(BasePBSolver):
         end_time = time.time()
         event_log = await self._read_event_log(computer, command_output)
         self._write_run_logs(task, event_log)
+        try:
+            await self._persist_refreshed_auth(computer)
+        except Exception as exc:
+            auth_error = f"Could not persist refreshed Codex authentication: {exc}"
+            error_msg = f"{error_msg}; {auth_error}" if error_msg else auth_error
+            logger.exception(auth_error)
 
         rollout_metadata = {
             "model": self.model,

@@ -102,6 +102,7 @@ class ClusterConfig(ABC, SerializableBaseModel):
     pull_from_registry: bool = True
     wait_for_health: bool = True
     is_nvidia_gpu_env: bool = False
+    gpu_device_id: str | None = None
     jupyter_setup: list[str] = Field(
         default_factory=lambda: ["jupyter", "kernel", "--ip", "0.0.0.0"]
     )
@@ -156,6 +157,7 @@ class LocalConfig(ClusterConfig):
             local_network=self.local_network,
             jupyter_setup=self.jupyter_setup,
             is_nvidia_gpu_env=self.is_nvidia_gpu_env,
+            gpu_device_id=self.gpu_device_id,
             environment=self.environment,
             volumes_config=self.volumes_config,
             azure_files_config=self.azure_files_config,
@@ -336,6 +338,7 @@ class BaseAlcatrazCluster(ABC):
         local_network: bool = False,
         jupyter_setup: list[str] | None = None,
         is_nvidia_gpu_env: bool = False,  # you better have nvidia gpus on your machine if you use this
+        gpu_device_id: str | None = None,
         privileged: bool = False,
         shm_size: str | None = None,
         mem_limit: str | None = None,
@@ -360,6 +363,7 @@ class BaseAlcatrazCluster(ABC):
         self.backup_buffers: dict[str, io.BytesIO] = {}
         self.container_procs: dict[str, ContainerProc] = {}
         self.is_nvidia_gpu_env = is_nvidia_gpu_env
+        self.gpu_device_id = gpu_device_id
         self.privileged = privileged
         self.shm_size = shm_size
         self.mem_limit = mem_limit
@@ -542,6 +546,18 @@ class BaseAlcatrazCluster(ABC):
 
         await _pull_image_inner()
 
+    def _gpu_device_requests(self) -> list[docker.types.DeviceRequest]:
+        if not self.is_nvidia_gpu_env:
+            return []
+        if self.gpu_device_id is not None:
+            return [
+                docker.types.DeviceRequest(
+                    device_ids=[self.gpu_device_id],
+                    capabilities=[["gpu"]],
+                )
+            ]
+        return [docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])]
+
     async def _start(self) -> None:
         # Exit stack handles removing all the containers and networks when we're done.
         self.socat_container: Container | None = None
@@ -691,11 +707,7 @@ class BaseAlcatrazCluster(ABC):
                 image=image,
                 name=f"container{i}-{self.container_group_name.split('alcatraz-')[1]}",
                 runtime=runtime if i == 0 else "runc",
-                device_requests=(
-                    [docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])]
-                    if self.is_nvidia_gpu_env and i == 0
-                    else []
-                ),
+                device_requests=self._gpu_device_requests() if i == 0 else [],
                 stdin_open=True,
                 tty=True,
                 detach=True,  # Equivalent to '-d'
@@ -1825,6 +1837,7 @@ class LocalCluster(BaseAlcatrazCluster):
         health_check: bool = False,
         jupyter_setup: list[str] | None = None,
         is_nvidia_gpu_env: bool = False,  # you better have nvidia gpus on your machine if you use this
+        gpu_device_id: str | None = None,
         privileged: bool = False,  # don't use on your mac. temp support for cua when running in VM
         environment: dict[str, str] | None = None,
         disk_mount_path: str | None = None,
@@ -1848,6 +1861,7 @@ class LocalCluster(BaseAlcatrazCluster):
             local_network=local_network,
             jupyter_setup=jupyter_setup,
             is_nvidia_gpu_env=is_nvidia_gpu_env,
+            gpu_device_id=gpu_device_id,
             privileged=privileged,
             shm_size=shm_size,
             mem_limit=mem_limit,

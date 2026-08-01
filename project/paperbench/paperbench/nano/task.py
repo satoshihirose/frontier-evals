@@ -517,6 +517,7 @@ class PBTask(ComputerTask):
                 code_only=self.judge.code_only,
                 computer=computer,
                 resources_provided=self.judge.resources_provided,
+                leaf_checkpoint_path=self.judge.leaf_checkpoint_path,
             )
 
         ctx_logger.info(

@@ -1,10 +1,11 @@
 from pathlib import Path
-from typing import cast, get_args, get_type_hints
+from typing import cast
 
 import pytest
 
 from nanoeval.solvers.computer_tasks.code_execution_interface import ComputerInterface, NetworkMode
 from paperbench.nano.eval import PaperBench
+from paperbench.nano.utils import load_paper_split
 from paperbench.requirements import REQUIREMENTS_CONTAINER_PATH
 from paperbench.solvers.codex.solver import CodexSolver
 from paperbench.utils import get_experiments_dir
@@ -29,22 +30,25 @@ def test_semantic_poc_split_contains_only_target_paper() -> None:
 
 
 def test_semantic_poc_is_an_accepted_paper_split() -> None:
-    annotation = get_type_hints(PaperBench)["paper_split"]
-
-    assert "semantic-poc" in get_args(annotation)
     assert Path(get_experiments_dir(), "splits", "semantic-poc.txt").exists()
+    assert load_paper_split("semantic-poc") == ["semantic-self-consistency"]
 
 
 @pytest.mark.parametrize(
     ("split_name", "paper_id"),
-    [("bam-poc", "bam"), ("bbox-poc", "bbox")],
+    [
+        ("adaptive-pruning-poc", "adaptive-pruning"),
+        ("bam-poc", "bam"),
+        ("bbox-poc", "bbox"),
+        ("mechanistic-understanding-poc", "mechanistic-understanding"),
+        ("stochastic-interpolants-poc", "stochastic-interpolants"),
+    ],
 )
 def test_additional_poc_splits_are_accepted(split_name: str, paper_id: str) -> None:
-    annotation = get_type_hints(PaperBench)["paper_split"]
     split_path = Path(get_experiments_dir(), "splits", f"{split_name}.txt")
 
-    assert split_name in get_args(annotation)
     assert split_path.read_text().splitlines() == [paper_id]
+    assert load_paper_split(split_name) == [paper_id]
 
 
 @pytest.mark.asyncio

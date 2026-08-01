@@ -176,6 +176,7 @@ async def reproduce_on_computer(
     timeout: float | None = None,
     use_py3_11: bool = False,
     make_venv: bool = False,
+    attempt_index: int | None = None,
 ) -> ReproductionMetadata:
     """
     Reproduce a single submission on a computer.
@@ -222,14 +223,13 @@ async def reproduce_on_computer(
             make_venv=make_venv,
         )
 
-        # Step 3: Save metadata
-        path_to_output = submission_path.replace(".tar.gz", "_executed_metadata.json")
-        bf.write_bytes(path_to_output, json.dumps(repro_metadata.to_dict()).encode("utf-8"))
-
-        # Step 4: Save the reproduced submission itself
-        timestamp = Path(submission_path).parts[-2]
+        # Step 3: Save the reproduced submission itself. Salvage attempts use unique
+        # paths so the final selector can promote an earlier attempt without rerunning it.
+        attempt_suffix = "" if attempt_index is None else f"_attempt_{attempt_index}"
         upload_from = output_cluster_path / "submission_executed.tar.gz"
-        upload_to = bf.join(run_dir, "submissions", timestamp, "submission_executed.tar.gz")
+        upload_to = submission_path.replace(
+            ".tar.gz", f"_executed{attempt_suffix}.tar.gz"
+        )
         await tar_and_extract_from_computer(
             computer=computer,
             dir_path_on_computer=submission_cluster_path,
@@ -242,6 +242,13 @@ async def reproduce_on_computer(
         )
 
         ctx_logger.info(f"Reproduced dir has been written: {upload_to}")
+
+        # Step 4: Save attempt metadata beside its executed submission.
+        repro_metadata = replace(repro_metadata, executed_submission=upload_to)
+        path_to_output = submission_path.replace(
+            ".tar.gz", f"_executed{attempt_suffix}_metadata.json"
+        )
+        bf.write_bytes(path_to_output, json.dumps(repro_metadata.to_dict()).encode("utf-8"))
 
         time_end = time.time()
         ctx_logger.info(f"Reproduction completed in {time_end - time_start:.2f} seconds.")
@@ -286,7 +293,7 @@ async def reproduce_on_computer_with_salvaging(
         run_group_id=run_group_id, runs_dir=runs_dir, run_id=run_id, destinations=["run"]
     )
 
-    for opts in retry_options:
+    for attempt_index, opts in enumerate(retry_options):
         ctx_logger.info(
             f"Executing reproduce.sh with py3_11={opts['use_py3_11']}"
             f" and make_venv={opts['make_venv']}"
@@ -305,6 +312,7 @@ async def reproduce_on_computer_with_salvaging(
             timeout=timeout,
             use_py3_11=opts["use_py3_11"],
             make_venv=opts["make_venv"],
+            attempt_index=attempt_index if retries_enabled else None,
         )
         repro_attempts.append(repro_attempt)
         if _should_retry(retries_enabled, repro_attempt, retry_threshold):
@@ -316,8 +324,39 @@ async def reproduce_on_computer_with_salvaging(
         else:
             break  # this last attempt was it
 
-    repro_metadata = repro_attempts[-1]
-    repro_metadata = _populate_retried_results(repro_metadata, repro_attempts[:-1])
+    selected_index = len(repro_attempts) - 1
+    if retries_enabled and all(
+        _should_retry(True, attempt, retry_threshold) for attempt in repro_attempts
+    ):
+        # The original PaperBench heuristic treats a longer run as less likely to be an
+        # early exit. If no attempt reaches the threshold, the final attempt has no
+        # special claim to validity, so selecting the longest one preserves that
+        # heuristic while avoiding an arbitrary last-attempt overwrite.
+        selected_index = max(
+            range(len(repro_attempts)),
+            key=lambda index: (
+                repro_attempts[index].repro_execution_time or 0,
+                -index,
+            ),
+        )
+        ctx_logger.info(
+            "No reproduction attempt reached the retry threshold; selecting the "
+            f"longest attempt ({selected_index})."
+        )
+
+    repro_metadata = repro_attempts[selected_index]
+    canonical_submission = submission_path.replace(".tar.gz", "_executed.tar.gz")
+    if repro_metadata.executed_submission != canonical_submission:
+        if repro_metadata.executed_submission is None:
+            raise ValueError("Selected reproduction attempt has no executed submission")
+        bf.copy(repro_metadata.executed_submission, canonical_submission, overwrite=True)
+    repro_metadata = replace(repro_metadata, executed_submission=canonical_submission)
+    other_attempts = [
+        attempt for index, attempt in enumerate(repro_attempts) if index != selected_index
+    ]
+    repro_metadata = _populate_retried_results(repro_metadata, other_attempts)
+    canonical_metadata = submission_path.replace(".tar.gz", "_executed_metadata.json")
+    bf.write_bytes(canonical_metadata, json.dumps(repro_metadata.to_dict()).encode("utf-8"))
 
     return repro_metadata
 

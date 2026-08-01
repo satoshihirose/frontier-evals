@@ -25,3 +25,13 @@ def test_build_script_builds_base_before_codex_image() -> None:
     reproducer_build = script.index("-t pb-reproducer")
 
     assert base_build < codex_build < reproducer_build
+
+
+def test_reproducer_exposes_python_pip_and_jupyter_commands_for_alcatraz() -> None:
+    dockerfile = (PAPERBENCH_ROOT / "paperbench" / "reproducer.Dockerfile").read_text()
+
+    assert "python3-pip" in dockerfile
+    assert "jupyter" in dockerfile
+    assert "/usr/local/bin/python" in dockerfile
+    assert "/usr/local/bin/pip" in dockerfile
+    assert "RUN jupyter --version" in dockerfile

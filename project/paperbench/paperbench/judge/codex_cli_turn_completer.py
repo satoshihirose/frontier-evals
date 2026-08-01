@@ -4,17 +4,47 @@ import asyncio
 import json
 import os
 import shutil
+import signal
 import tempfile
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Literal, Unpack
 
+import structlog.stdlib
 import tiktoken
 from openai.types.chat import ChatCompletionMessage
 from preparedness_turn_completer.turn_completer import TurnCompleter
 from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import override
 
+from paperbench.judge.structured_output import make_strict_json_schema
+
 ReasoningEffort = Literal["none", "low", "medium", "high", "xhigh", "max"]
+logger = structlog.stdlib.get_logger(component=__name__)
+
+
+async def terminate_process_group(
+    process: asyncio.subprocess.Process,
+    *,
+    grace_seconds: float = 5,
+) -> None:
+    """Terminate a Codex process and every descendant in its process group."""
+    if process.returncode is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        await asyncio.wait_for(process.wait(), timeout=grace_seconds)
+        return
+    except TimeoutError:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    await process.wait()
 
 
 def build_codex_cli_args(
@@ -33,6 +63,16 @@ def build_codex_cli_args(
         model,
         "-c",
         f'model_reasoning_effort="{reasoning_effort}"',
+        "-c",
+        "features.shell_tool=false",
+        "-c",
+        'web_search="disabled"',
+        "-c",
+        "agents.enabled=false",
+        "-c",
+        "features.multi_agent=false",
+        "-c",
+        "features.apps=false",
         "--ephemeral",
         "--ignore-user-config",
         "--skip-git-repo-check",
@@ -51,20 +91,9 @@ def build_codex_cli_args(
 
 def _render_conversation(conversation: TurnCompleter.RuntimeConversation) -> str:
     return (
-        "Respond to the following conversation as the assistant. Do not use tools.\n\n"
+        "Respond to the following conversation as the assistant.\n\n"
         + json.dumps(conversation, ensure_ascii=False, default=str)
     )
-
-
-def make_strict_json_schema(value: Any) -> Any:
-    if isinstance(value, dict):
-        strict = {key: make_strict_json_schema(item) for key, item in value.items()}
-        if strict.get("type") == "object":
-            strict["additionalProperties"] = False
-        return strict
-    if isinstance(value, list):
-        return [make_strict_json_schema(item) for item in value]
-    return value
 
 
 class CodexCliTurnCompleter(TurnCompleter):
@@ -82,6 +111,7 @@ class CodexCliTurnCompleter(TurnCompleter):
         codex_home: str = "~/.codex"
         response_format: type[BaseModel] | None = None
         timeout_seconds: float = Field(default=900.0, gt=0)
+        timeout_retries: int = Field(default=1, ge=0)
         max_concurrency: int = Field(default=4, gt=0)
         context_window: int = Field(default=272_000, gt=0)
 
@@ -94,6 +124,7 @@ class CodexCliTurnCompleter(TurnCompleter):
                 codex_home=Path(self.codex_home).expanduser(),
                 response_format=self.response_format,
                 timeout_seconds=self.timeout_seconds,
+                timeout_retries=self.timeout_retries,
                 max_concurrency=self.max_concurrency,
                 context_window=self.context_window,
             )
@@ -102,6 +133,19 @@ class CodexCliTurnCompleter(TurnCompleter):
             self, response_format: type[BaseModel]
         ) -> CodexCliTurnCompleter.Config:
             return self.model_copy(update={"response_format": response_format})
+
+        def checkpoint_identity(self) -> dict[str, Any]:
+            return {
+                "backend": self.backend,
+                "model": self.model,
+                "reasoning_effort": self.reasoning_effort,
+                "response_format": (
+                    f"{self.response_format.__module__}:{self.response_format.__qualname__}"
+                    if self.response_format is not None
+                    else None
+                ),
+                "context_window": self.context_window,
+            }
 
     class Completion(TurnCompleter.Completion):
         pass
@@ -115,6 +159,7 @@ class CodexCliTurnCompleter(TurnCompleter):
         codex_home: Path,
         response_format: type[BaseModel] | None,
         timeout_seconds: float,
+        timeout_retries: int,
         max_concurrency: int,
         context_window: int,
     ) -> None:
@@ -124,6 +169,7 @@ class CodexCliTurnCompleter(TurnCompleter):
         self.codex_home = codex_home.resolve()
         self.response_format = response_format
         self.timeout_seconds = timeout_seconds
+        self.timeout_retries = timeout_retries
         self.max_concurrency = max_concurrency
         self.n_ctx = context_window
         self._encoder = tiktoken.get_encoding(self.encoding_name)
@@ -180,6 +226,23 @@ class CodexCliTurnCompleter(TurnCompleter):
         **params: Unpack[TurnCompleter.Params],
     ) -> CodexCliTurnCompleter.Completion:
         del params
+        for attempt in range(self.timeout_retries + 1):
+            try:
+                return await self._async_completion_once(conversation)
+            except TimeoutError:
+                if attempt >= self.timeout_retries:
+                    raise
+                logger.warning(
+                    "Retrying timed-out Codex CLI judge call",
+                    attempt=attempt + 1,
+                    max_attempts=self.timeout_retries + 1,
+                )
+        raise AssertionError("unreachable")
+
+    async def _async_completion_once(
+        self,
+        conversation: TurnCompleter.RuntimeConversation,
+    ) -> CodexCliTurnCompleter.Completion:
         auth_path = self.codex_home / "auth.json"
         if not auth_path.is_file():
             raise FileNotFoundError(f"Codex ChatGPT authentication file not found: {auth_path}")
@@ -214,19 +277,32 @@ class CodexCliTurnCompleter(TurnCompleter):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=self._subscription_env(runtime_codex_home),
+                start_new_session=True,
+            )
+            communication = asyncio.create_task(
+                process.communicate(_render_conversation(conversation).encode())
             )
             try:
-                _, stderr = await asyncio.wait_for(
-                    process.communicate(_render_conversation(conversation).encode()),
-                    timeout=self.timeout_seconds,
-                )
+                done, _ = await asyncio.wait({communication}, timeout=self.timeout_seconds)
+                if not done:
+                    await terminate_process_group(process)
+                    try:
+                        await asyncio.wait_for(communication, timeout=5)
+                    except TimeoutError:
+                        communication.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await communication
+                    raise TimeoutError(
+                        f"Codex CLI judge timed out after {self.timeout_seconds} seconds"
+                    )
+                _, stderr = communication.result()
+            except asyncio.CancelledError:
+                await terminate_process_group(process)
+                communication.cancel()
+                with suppress(asyncio.CancelledError):
+                    await communication
+                raise
             except TimeoutError:
-                process.terminate()
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=5)
-                except TimeoutError:
-                    process.kill()
-                    await process.wait()
                 raise TimeoutError(
                     f"Codex CLI judge timed out after {self.timeout_seconds} seconds"
                 ) from None

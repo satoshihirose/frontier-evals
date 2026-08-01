@@ -289,34 +289,49 @@ SHA-256, and the container path. The run-group summary records the same conditio
 embedding the machine-specific host path. Use a new run group when changing this condition;
 resuming a rollout created under another input condition would not be a valid comparison.
 
-#### Running BBox-Adapter on roemia with experiment data under `/data`
+#### Running a PoC paper on roemia with experiment data under `/data`
 
 Keep the `frontier-evals` checkout under `/data/$USER` on roemia. The
-[`run-bbox-roemia.sh`](paperbench/scripts/run-bbox-roemia.sh) launcher runs the full BBox-Adapter
-task with the existing PaperBench and Alcatraz volume settings; it does not change PaperBench's
-task logic. Docker images remain in Docker's configured data root, while host run artifacts are
-written to `/data/$USER/paperbench/runs`. The launcher bind-mounts
+[`run-paperbench-roemia.sh`](paperbench/scripts/run-paperbench-roemia.sh) launcher runs one full
+PoC task selected by `--paper`. Supported paper IDs are `bam`, `bbox`, and
+`semantic-self-consistency`; the launcher maps them to the existing PaperBench single-paper
+splits and does not change task logic. Docker images remain in Docker's configured data root,
+while host run artifacts are written to `/data/$USER/paperbench/runs`. The launcher bind-mounts
 `/data/$USER/paperbench/cache` at `/root/.cache` in both the Codex agent and reproduction
 containers, and uses separate `/data`-backed `/tmp` directories for the two stages. This keeps
 Hugging Face, Torch, pip, dataset, and temporary downloads out of Docker's writable layers.
+At startup, the launcher excludes GPUs with active compute processes, chooses the remaining GPU
+with the most free memory, and passes its UUID to both stages. Alcatraz exposes only that GPU to
+each Docker container. A per-GPU lock under `/data/$USER/paperbench/gpu-locks` prevents concurrent
+instances of this launcher from choosing the same device.
 
 After building `pb-env`, `pb-codex-env`, and `pb-reproducer`, inspect the command without
 starting a run:
 
 ```bash
-paperbench/scripts/run-bbox-roemia.sh --dry-run
+paperbench/scripts/run-paperbench-roemia.sh --paper bam --dry-run
 ```
 
-Run the baseline condition without a Requirements CSV:
+Run the BaM baseline condition without a Requirements CSV:
 
 ```bash
-paperbench/scripts/run-bbox-roemia.sh
+paperbench/scripts/run-paperbench-roemia.sh --paper bam
 ```
+
+To request a particular idle GPU by host index or UUID instead of selecting one automatically:
+
+```bash
+paperbench/scripts/run-paperbench-roemia.sh --paper bam --gpu 0
+```
+
+The launcher stops rather than falling back to another device if the requested GPU is busy or
+locked. `PAPERBENCH_GPU_DEVICE` provides the equivalent environment override.
 
 Run the Requirements condition by naming the exact CSV explicitly:
 
 ```bash
-paperbench/scripts/run-bbox-roemia.sh \
+paperbench/scripts/run-paperbench-roemia.sh \
+    --paper bam \
     --requirements-csv /absolute/path/to/requirements.csv
 ```
 
@@ -327,13 +342,83 @@ configuration can be tested without a GPU server.
 #### Switching the judge backend
 
 Keep the rollout, submission, rubric, and `SimpleJudge` unchanged, and select only the
-`TurnCompleter` backend. For development grading with the ChatGPT-authenticated Codex CLI, add:
+`TurnCompleter` backend.
+
+For development grading against the local Qwen vLLM server, add:
+
+```bash
+paperbench.judge.completer_config=paperbench.judge.local_judge_completer:LocalJudgeCompleter.Config \
+paperbench.judge.completer_config.model='Qwen/Qwen3.6-27B' \
+paperbench.judge.completer_config.base_url='http://127.0.0.1:58137/v1' \
+paperbench.judge.completer_config.tokenizer_path='/absolute/path/to/Qwen--Qwen3.6-27B/tokenizer.json' \
+paperbench.judge.completer_config.max_concurrency=4
+```
+
+For two vLLM data-parallel ranks behind the same endpoint, use eight concurrent
+Judge calls and enable explicit rank routing:
+
+```bash
+paperbench.judge.completer_config.max_concurrency=8 \
+paperbench.judge.completer_config.data_parallel_size=2
+```
+
+`LocalJudgeCompleter` sends the existing role-tagged Judge messages directly to vLLM's
+OpenAI-compatible `/chat/completions` endpoint. It does not add or rewrite a prompt. The same
+backend is automatically used for the main leaf decision and the structured score-parsing call.
+When `data_parallel_size` is greater than one, these completers share a least-in-flight router
+and send vLLM's `X-data-parallel-rank` header. A rank is released after either a successful
+response or an exception. This prevents completed and waiting requests from accumulating on one
+rank while another rank is idle.
+Structured calls send a strict JSON Schema and validate the returned JSON before PaperBench uses
+it. The defaults target Qwen3.6-27B with `temperature=1.0`, `top_p=0.95`,
+`presence_penalty=1.5`, and `seed=0`. Like PaperBench's API Judge configuration, the local
+completer uses a 200,000-token context and does not send `max_tokens` unless it is explicitly
+overridden. When `tokenizer_path` is set, `SimpleJudge` truncates its paper, logs, and selected
+submission files using that model's Hugging Face `tokenizer.json`; API and Codex CLI completers
+continue to use their original `tiktoken` encodings. The context value is a maximum rather than a
+fixed allocation for every request.
+Generation settings and
+the model and tokenizer-file content are part of the leaf-checkpoint identity; the server address,
+timeout, retry count, and concurrency are operational settings and do not invalidate completed
+leaves. The local server
+needs no OpenAI credential; when its endpoint requires a bearer token, store it only in the
+environment variable named by `api_key_env` (default: `QWEN_JUDGE_API_KEY`).
+
+The local score is a development proxy, not a PaperBench-comparable final score, because the
+model and serving stack differ from the canonical Judge. Start vLLM after GPU reproduction has
+finished, or reserve a separate GPU for it. To grade an already saved and executed submission
+without rerunning the Agent or reproduction, use the same completer with the standalone Judge.
+On roemia, wrap this command with
+`research/project/ReproGapBench/infra/roemia/with_qwen_judge.sh --gpu <GPU> --` to start the
+server only when absent and safely stop only a server owned by that wrapper:
+
+```bash
+uv run python paperbench/scripts/run_judge.py \
+  submission_path=/absolute/path/to/submission_executed \
+  paper_id=bam \
+  judge=simple \
+  code_only=True \
+  out_dir=/data/$USER/paperbench/local-judge/bam \
+  leaf_checkpoint_path=/data/$USER/paperbench/local-judge/bam/leaf-checkpoints.jsonl \
+  completer_config=paperbench.judge.local_judge_completer:LocalJudgeCompleter.Config \
+  completer_config.base_url='http://127.0.0.1:58137/v1' \
+  completer_config.tokenizer_path='/absolute/path/to/Qwen--Qwen3.6-27B/tokenizer.json'
+```
+
+Restart the same command with the same `leaf_checkpoint_path` to reuse every
+compatible, successfully graded leaf. The standalone command fingerprints the
+submission directory before grading, so the checkpoint is not reused after a
+submission file changes.
+
+For development grading with the ChatGPT-authenticated Codex CLI, add:
 
 ```bash
 paperbench.judge.completer_config=paperbench.judge.codex_cli_turn_completer:CodexCliTurnCompleter.Config \
 paperbench.judge.completer_config.model='gpt-5.4' \
 paperbench.judge.completer_config.codex_home='~/.codex' \
 paperbench.judge.completer_config.reasoning_effort=high \
+paperbench.judge.completer_config.timeout_seconds=900 \
+paperbench.judge.completer_config.timeout_retries=1 \
 paperbench.judge.completer_config.max_concurrency=4
 ```
 
@@ -341,8 +426,11 @@ paperbench.judge.completer_config.max_concurrency=4
 ChatGPT-authenticated Codex CLI. It is still substantially newer than the canonical
 `o3-mini-2025-01-31` judge, so it is only a development proxy. The `high` reasoning setting
 matches PaperBench's canonical main judge setting. The CLI backend
-serializes the existing Judge conversation and adds only a request to respond as its assistant
-without using tools. It otherwise leaves the Judge messages unchanged. The backend
+serializes the existing Judge conversation and adds only the transport instruction
+`Respond to the following conversation as the assistant.` because `codex exec` accepts one
+input prompt rather than a native role-tagged conversation. It otherwise leaves the Judge
+messages unchanged. Shell, web-search, subagent, and app tools are disabled through Codex CLI
+configuration rather than through an extra prompt instruction. The backend
 copies only `auth.json` into a private temporary `CODEX_HOME`, verifies that
 `codex login status` reports ChatGPT authentication, removes `OPENAI_API_KEY` and
 `GRADER_OPENAI_API_KEY` from every Codex process, and deletes the temporary home after each
@@ -364,6 +452,66 @@ in `completer_config`. Treat a CLI grade as a development measurement: model sna
 Codex execution layer differ from the canonical API judge. Report the API grade as the final
 PaperBench score, and compare CLI/API leaf decisions separately when evaluating the cheaper
 development judge.
+
+#### Reproduction salvage attempt selection
+
+PaperBench retains its existing reproduction salvage conditions: an attempt that runs for less
+than `retry_threshold` (600 seconds by default) is retried with the next Python/virtualenv
+configuration, while an attempt reaching the threshold is selected immediately. If every
+attempt is shorter than the threshold, the longest attempt is selected instead of the last
+attempt. This fallback follows PaperBench's existing assumption that a longer run is less likely
+to be an early exit, while preventing a short failure in the final configuration from
+arbitrarily replacing a more substantive earlier attempt.
+
+When salvage is enabled, each attempt is retained as
+`submission_executed_attempt_N.tar.gz` with matching metadata. The selected archive is copied to
+the canonical `submission_executed.tar.gz` path consumed by the Judge. Consequently, future
+analysis can select another retained attempt without rerunning the Agent rollout.
+
+#### Judge timeout and leaf-level resume
+
+Each Codex CLI call has a 900-second limit by default. Codex is started in a separate POSIX
+process group; when the limit is reached, PaperBench sends `SIGTERM` to the entire group,
+waits five seconds, and then sends `SIGKILL` if anything remains. The timed-out call is retried
+once by default. These are per-call settings: one leaf can include file selection, grading, and
+structured score-parsing calls, and only the call that timed out is repeated. Set
+`timeout_retries=0` to disable that retry.
+
+Every successfully graded leaf is appended immediately to
+`*_leaf_checkpoints.jsonl` beside the grader output. If grading is interrupted before
+`*_grader_output_*.json` is written, running the Judge again with the same checkpoint file
+reuses completed leaves and calls the Judge only for unfinished or invalid leaves. A saved
+leaf is reused only when all of the following match:
+
+- the extracted submission paths and file contents;
+- the target paper, agent addendum, and Judge addendum;
+- the filtered rubric, including `code_only` and resource settings;
+- the Judge type, model, reasoning setting, and response format;
+- the leaf ID and full leaf requirement.
+
+Authentication paths, concurrency, timeout, and retry settings are operational details and do
+not invalidate otherwise compatible checkpoints. When retrying in the same run path, the
+sidecar is selected automatically. When launching a new run around the same saved submission,
+pass the previous file explicitly:
+
+An individual leaf that raises an exception or returns `valid_score=False` is retried up to
+three times after its initial attempt. Only a valid result is written to the checkpoint. If all
+four attempts are invalid, the final invalid result is retained in the grader output so that the
+run remains auditable and the leaf can be resumed later from the same checkpoint.
+
+```bash
+paperbench.judge.leaf_checkpoint_path='/absolute/path/to/submission_executed_grader_output_0_leaf_checkpoints.jsonl'
+```
+
+For `paperbench/scripts/run_judge.py`, use the standalone field instead:
+
+```bash
+leaf_checkpoint_path='/absolute/path/to/leaf-checkpoints.jsonl'
+```
+
+The leaf checkpoint mechanism is shared by API and CLI `SimpleJudge`; process-group termination
+and per-call timeout retry apply only to the Codex CLI backend. A completed grader output still
+takes precedence unless `paperbench.judge.overwrite_existing_output=True` is set.
 
 ### Canonical command
 
@@ -448,6 +596,8 @@ In each run directory there is:
   - `submission.tar.gz`: The archived submission files
   - If the submission was executed/graded, the directory may also contain:
     - `submission_executed_grader_output_0.json`: Output from the grader.
+    - `submission_executed_grader_output_0_leaf_checkpoints.jsonl`: Successfully graded leaves
+      saved incrementally for interrupted-Judge resume.
     - `submission_executed_metadata.json`: Metadata about the execution.
     - `submission_executed.tar.gz`: The archived files after execution.
 
@@ -473,6 +623,7 @@ runs/
 │   │   │       ├── log.json
 │   │   │       ├── submission.tar.gz
 │   │   │       ├── submission_executed_grader_output_0.json  # if graded
+│   │   │       ├── submission_executed_grader_output_0_leaf_checkpoints.jsonl
 │   │   │       ├── submission_executed_metadata.json  # if executed
 │   │   │       └── submission_executed.tar.gz  # if executed
 │   └── <other_run_ids>/...

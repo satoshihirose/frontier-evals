@@ -23,10 +23,12 @@ from paperbench.solvers.basicagent.prompts.templates import (
     get_system_message,
 )
 from paperbench.solvers.codex.solver import (
+    CODEX_AUTH_CHMOD_COMMAND,
     CODEX_AUTH_PATH,
     CODEX_AUTH_STATUS_COMMAND,
     CODEX_EVENT_LOG,
     CODEX_HOME,
+    CODEX_HOME_PREPARE_COMMAND,
     CODEX_ROLLOUT_METADATA,
     INSTRUCTIONS_PATH,
     URL_OBSERVATIONS_FILENAME,
@@ -57,6 +59,7 @@ class FakeComputer(ComputerInterface):
         self.commands: list[str] = []
         self.uploads: dict[str, bytes] = {}
         self.download_count = 0
+        self.refreshed_auth = b'{"tokens": {"access_token": "refreshed"}}\n'
 
     async def disable_internet(self) -> None:
         raise NotImplementedError
@@ -65,6 +68,8 @@ class FakeComputer(ComputerInterface):
         self.uploads[destination] = file
 
     async def download(self, file: str) -> bytes:
+        if file == CODEX_AUTH_PATH:
+            return self.refreshed_auth
         assert file == CODEX_EVENT_LOG
         self.download_count += 1
         return self.event_log
@@ -309,7 +314,7 @@ def test_codex_solver_uses_shell_only_runtime() -> None:
     assert isinstance(CodexSolver().computer_runtime, AlcatrazComputerRuntimeNoJupyter)
 
 
-def test_codex_solver_mounts_chatgpt_auth_read_only(tmp_path: Path) -> None:
+def test_codex_solver_keeps_host_auth_out_of_container_mounts(tmp_path: Path) -> None:
     auth_file = tmp_path / "auth.json"
     auth_file.write_text('{"tokens": {}}')
     task = cast(PBTask, SimpleNamespace(volumes_config=None))
@@ -317,13 +322,7 @@ def test_codex_solver_mounts_chatgpt_auth_read_only(tmp_path: Path) -> None:
 
     configured_task = solver._handle_docker_socket_mounting(task)
 
-    assert configured_task.volumes_config == {
-        "codexauth": {
-            "bind_source": str(auth_file.resolve()),
-            "bind_dest": CODEX_AUTH_PATH,
-            "mode": "ro",
-        }
-    }
+    assert configured_task.volumes_config is None
 
 
 def test_codex_solver_rejects_missing_chatgpt_auth_file(tmp_path: Path) -> None:
@@ -339,21 +338,48 @@ def test_codex_solver_rejects_missing_chatgpt_auth_file(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_codex_solver_checks_cli_and_records_version(tmp_path: Path) -> None:
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text('{"tokens": {"access_token": "initial"}}\n')
     task = make_task(tmp_path)
     computer = FakeComputer()
-    solver = CodexSolver()
+    solver = CodexSolver(codex_auth_file=str(auth_file))
 
     await solver._setup_computer(computer, task)
 
-    assert computer.commands == ["codex --version", CODEX_AUTH_STATUS_COMMAND]
+    assert computer.commands == [
+        CODEX_HOME_PREPARE_COMMAND,
+        CODEX_AUTH_CHMOD_COMMAND,
+        "codex --version",
+        CODEX_AUTH_STATUS_COMMAND,
+    ]
+    assert computer.uploads[CODEX_AUTH_PATH] == auth_file.read_bytes()
     assert computer.uploads["/home/logs/codex-version.txt"] == b"codex-cli 0.144.2\n"
 
 
 @pytest.mark.asyncio
+async def test_codex_solver_persists_refreshed_auth_only_when_requested(tmp_path: Path) -> None:
+    auth_file = tmp_path / "runtime-codex-home" / "auth.json"
+    auth_file.parent.mkdir()
+    auth_file.write_text('{"tokens": {"access_token": "initial"}}\n')
+    computer = FakeComputer()
+    solver = CodexSolver(
+        codex_auth_file=str(auth_file),
+        persist_refreshed_auth=True,
+    )
+
+    await solver._persist_refreshed_auth(computer)
+
+    assert auth_file.read_bytes() == computer.refreshed_auth
+    assert auth_file.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.asyncio
 async def test_codex_solver_rejects_agent_image_without_cli(tmp_path: Path) -> None:
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text('{"tokens": {}}\n')
     task = make_task(tmp_path)
     computer = FakeComputer(version_exit_code=127)
-    solver = CodexSolver()
+    solver = CodexSolver(codex_auth_file=str(auth_file))
 
     with pytest.raises(RuntimeError, match="Codex CLI is unavailable"):
         await solver._setup_computer(computer, task)
@@ -361,9 +387,11 @@ async def test_codex_solver_rejects_agent_image_without_cli(tmp_path: Path) -> N
 
 @pytest.mark.asyncio
 async def test_codex_solver_rejects_invalid_chatgpt_auth(tmp_path: Path) -> None:
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text('{"tokens": {}}\n')
     task = make_task(tmp_path)
     computer = FakeComputer(auth_exit_code=1)
-    solver = CodexSolver()
+    solver = CodexSolver(codex_auth_file=str(auth_file))
 
     with pytest.raises(RuntimeError, match="ChatGPT subscription authentication"):
         await solver._setup_computer(computer, task)

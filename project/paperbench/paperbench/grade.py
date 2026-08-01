@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import tarfile
 import tempfile
@@ -17,6 +19,7 @@ from nanoeval.solvers.computer_tasks.code_execution_interface import ComputerInt
 from paperbench.computer_utils import put_submission_in_computer
 from paperbench.judge.create_judge import create_judge, handle_judge_kwargs
 from paperbench.judge.graded_task_node import GradedTaskNode
+from paperbench.judge.leaf_checkpoint import LeafCheckpointStore, stable_hash
 from paperbench.judge.token_usage import TokenUsage, get_total_token_usage
 from paperbench.paper_registry import paper_registry
 from paperbench.rubric.tasks import TaskNode
@@ -25,11 +28,49 @@ from paperbench.utils import get_timestamp
 logger = structlog.stdlib.get_logger(component=__name__)
 
 
+def hash_blob(path: str) -> str:
+    digest = hashlib.sha256()
+    with bf.BlobFile(path, "rb") as blob:
+        while chunk := blob.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def hash_submission_tree(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        relative_path = path.relative_to(root).as_posix().encode("utf-8")
+        if path.is_symlink():
+            digest.update(b"symlink\0" + relative_path + b"\0")
+            digest.update(path.readlink().as_posix().encode("utf-8"))
+        elif path.is_dir():
+            digest.update(b"directory\0" + relative_path + b"\0")
+        elif path.is_file():
+            digest.update(b"file\0" + relative_path + b"\0")
+            with path.open("rb") as submission_file:
+                while chunk := submission_file.read(8 * 1024 * 1024):
+                    digest.update(chunk)
+        else:
+            digest.update(b"other\0" + relative_path + b"\0")
+    return digest.hexdigest()
+
+
 def get_completer_backend(config: TurnCompleter.Config | None) -> str | None:
     if config is None:
         return None
     config_type = type(config)
     return f"{config_type.__module__}:{config_type.__qualname__}"
+
+
+def get_completer_checkpoint_config(
+    config: TurnCompleter.Config | None,
+) -> dict[str, Any] | None:
+    if config is None:
+        return None
+    checkpoint_identity = getattr(config, "checkpoint_identity", None)
+    if checkpoint_identity is not None:
+        return checkpoint_identity()
+    return config.model_dump(mode="json")
 
 
 @dataclass(frozen=True)
@@ -98,6 +139,8 @@ async def run_judge(
     out_dir: Path | None = None,
     resources_provided: bool = False,
     computer: ComputerInterface | None = None,
+    leaf_checkpoint_path: str | None = None,
+    submission_fingerprint: str | None = None,
 ) -> GradedTaskNode:
     """
     Judge a single submission (a directory of files) using the specified judge.
@@ -110,6 +153,11 @@ async def run_judge(
     rubric_path = paper.rubric
     paper_pdf_path = paper.paper_pdf
     paper_md_path = paper.paper_md
+    paper_md_content = paper_md_path.read_text()
+    addendum = paper.addendum.read_text() if paper.addendum else None
+    judge_addendum = (
+        paper.judge_addendum.read_text() if paper.judge_addendum.exists() else None
+    )
 
     logger.info(f"Judging submission for paper {rubric_path}")
     with open(rubric_path, "r") as f:
@@ -121,19 +169,42 @@ async def run_judge(
     if resources_provided:
         task_tree = task_tree.resources_provided()
 
+    leaf_checkpoint_store = None
+    if leaf_checkpoint_path is not None:
+        leaf_checkpoint_store = LeafCheckpointStore(
+            path=leaf_checkpoint_path,
+            context_hash=stable_hash(
+                {
+                    "paper_id": paper_id,
+                    "judge_type": judge_type,
+                    "code_only": code_only,
+                    "resources_provided": resources_provided,
+                    "max_depth": max_depth,
+                    "rubric": task_tree.to_dict(),
+                    "paper_md": paper_md_content,
+                    "addendum": addendum,
+                    "judge_addendum": judge_addendum,
+                    "completer_backend": get_completer_backend(completer_config),
+                    "completer_config": get_completer_checkpoint_config(completer_config),
+                    "submission_fingerprint": submission_fingerprint,
+                }
+            ),
+        )
+
     judge_kwargs = handle_judge_kwargs(judge_type, code_only, paper, completer_config)
     judge = create_judge(
         judge_type=judge_type,
         judge_kwargs=judge_kwargs,
         paper_path=paper_pdf_path,
         rubric=task_tree,
-        addendum=paper.addendum.read_text() if paper.addendum else None,
-        judge_addendum=paper.judge_addendum.read_text() if paper.judge_addendum.exists() else None,
+        addendum=addendum,
+        judge_addendum=judge_addendum,
         submission_dir=submission_path,
         paper_md=paper_md_path,
         log_path=out_dir,
         max_depth=max_depth,
         computer=computer,
+        leaf_checkpoint_store=leaf_checkpoint_store,
     )
 
     return await judge.judge()
@@ -151,6 +222,7 @@ async def grade_submission(
     code_only: bool = False,
     resources_provided: bool = False,
     computer: ComputerInterface | None = None,
+    leaf_checkpoint_path: str | None = None,
 ) -> JudgeOutput | None:
     """
     Grade a single submission. If a computer is provided, the submission will be graded on the computer.
@@ -189,6 +261,15 @@ async def grade_submission(
             ctx_logger.info(f"Unzipped submission for judge to {submission_dir}")
 
             # Step 2: Run the judge
+            leaf_checkpoint_path = leaf_checkpoint_path or (
+                f"{grader_upload_path.removesuffix('.json')}_leaf_checkpoints.jsonl"
+            )
+            if computer:
+                submission_fingerprint = await asyncio.to_thread(hash_blob, submission_path)
+            else:
+                submission_fingerprint = await asyncio.to_thread(
+                    hash_submission_tree, submission_dir
+                )
             graded_task_tree = await run_judge(
                 submission_path=submission_dir,
                 paper_id=paper_id,
@@ -197,6 +278,8 @@ async def grade_submission(
                 code_only=code_only,
                 resources_provided=resources_provided,
                 computer=computer,
+                leaf_checkpoint_path=leaf_checkpoint_path,
+                submission_fingerprint=submission_fingerprint,
             )
             if judge_type == "simple":
                 token_usage = get_total_token_usage(graded_task_tree)

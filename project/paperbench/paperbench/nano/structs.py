@@ -206,6 +206,7 @@ class JudgeConfig(BaseModel):
     )
     code_only: bool = False
     resources_provided: bool = False
+    leaf_checkpoint_path: str | None = None
     computer_runtime: ComputerRuntime = AlcatrazComputerRuntime()
     computer_config: ComputerConfiguration = ComputerConfiguration(
         docker_image="pb-env:latest",

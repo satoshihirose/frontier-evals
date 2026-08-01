@@ -32,6 +32,7 @@ from paperbench.judge.constants import (
     build_judge_task_prompt,
 )
 from paperbench.judge.graded_task_node import GradedTaskNode
+from paperbench.judge.leaf_checkpoint import LeafCheckpointStore
 from paperbench.judge.token_usage import TokenUsage
 from paperbench.judge.utils import format_file, read_file_content, walk_dir_with_mtimes
 from paperbench.rubric.tasks import TASK_CATEGORY_QUESTIONS, TaskNode
@@ -100,8 +101,8 @@ class SimpleJudge(Judge):
         submission_dir: Path,
         paper_md: Path,
         completer_config: TurnCompleter.Config,
-        int_completer_config: OpenAICompletionsTurnCompleter.Config | None = None,
-        float_completer_config: OpenAICompletionsTurnCompleter.Config | None = None,
+        int_completer_config: TurnCompleter.Config | None = None,
+        float_completer_config: TurnCompleter.Config | None = None,
         log_path: Path | None = None,
         buffer_tokens: int = 10000,  # 10k tokens of buffer
         max_depth: int = 999,
@@ -109,6 +110,7 @@ class SimpleJudge(Judge):
         max_prior_nodes: int | None = None,
         max_file_depth: int = 4,
         computer: ComputerInterface | None = None,
+        leaf_checkpoint_store: LeafCheckpointStore | None = None,
     ):
         super().__init__(
             paper_path=paper_path,
@@ -120,11 +122,17 @@ class SimpleJudge(Judge):
             max_depth=max_depth,
             code_only=code_only,
             computer=computer,
+            leaf_checkpoint_store=leaf_checkpoint_store,
         )
 
         self.completer_config = completer_config
         self.completer = completer_config.build()
-        self.token_encoder = tiktoken.get_encoding(self.completer.encoding_name)
+        get_token_encoder = getattr(self.completer, "get_token_encoder", None)
+        self.token_encoder = (
+            get_token_encoder()
+            if callable(get_token_encoder)
+            else tiktoken.get_encoding(self.completer.encoding_name)
+        )
 
         self.float_completer_conf, self.float_completer = self._init_structured_completer(
             float_completer_config, ParsedJudgeResponseFloat
@@ -469,7 +477,7 @@ class SimpleJudge(Judge):
             + "\n".join(path.as_posix() for path in selected_relative_paths)
         )
 
-        selected_files_tokens = []
+        selected_files_tokens: list[int] = []
         num_files = 0
         total_tokens = 0
         max_tokens = (
@@ -686,10 +694,11 @@ class SimpleJudge(Judge):
         existing_usage: TokenUsage | None,
         incoming_usage: CompletionUsage | None,
     ) -> TokenUsage | None:
-        if isinstance(completer, OpenAICompletionsTurnCompleter):
+        model = getattr(completer, "model", None)
+        if isinstance(model, str) and incoming_usage is not None:
             if existing_usage is None:
                 existing_usage = TokenUsage()
-            existing_usage.add_from_completion(completer.model, incoming_usage)
+            existing_usage.add_from_completion(model, incoming_usage)
 
         return existing_usage
 
@@ -744,11 +753,7 @@ class SimpleJudge(Judge):
             completer = self.int_completer if not continuous else self.float_completer
             completion = await completer.async_completion(conversation=messages)
 
-            usage = None
-            if isinstance(completer, OpenAICompletionsTurnCompleter) and isinstance(
-                completion, OpenAICompletionsTurnCompleter.Completion
-            ):
-                usage = completion.usage
+            usage = getattr(completion, "usage", None)
 
             content = completion.output_messages[0].content
             judge_response = ParsedJudgeResponse.model_validate_json(content) if content else None

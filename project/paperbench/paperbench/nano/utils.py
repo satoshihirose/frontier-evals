@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import structlog.stdlib
 
@@ -9,6 +11,34 @@ from paperbench.nano.structs import PaperBenchResult
 from paperbench.utils import get_experiments_dir
 
 logger = structlog.stdlib.get_logger(component=__name__)
+
+_SPLIT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+
+def load_paper_split(
+    split_name: str, *, splits_dir: Path | None = None
+) -> list[str]:
+    """Load one paper split, using its text file as the source of truth."""
+
+    if not _SPLIT_NAME_PATTERN.fullmatch(split_name):
+        raise ValueError(
+            f"Invalid paper split name {split_name!r}; use the split filename without '.txt'."
+        )
+
+    resolved_splits_dir = splits_dir or get_experiments_dir() / "splits"
+    split_path = resolved_splits_dir / f"{split_name}.txt"
+    if not split_path.is_file():
+        available = ", ".join(path.stem for path in sorted(resolved_splits_dir.glob("*.txt")))
+        raise ValueError(
+            f"Unknown paper split {split_name!r}. Available splits: {available or '(none)'}"
+        )
+
+    paper_ids = [
+        line.strip() for line in split_path.read_text().splitlines() if line.strip()
+    ]
+    if not paper_ids:
+        raise ValueError(f"Paper split {split_name!r} contains no paper IDs: {split_path}")
+    return paper_ids
 
 
 def get_split_to_expected_papers() -> dict[str, int]:
@@ -21,10 +51,9 @@ def get_split_to_expected_papers() -> dict[str, int]:
 
     for split_file in splits_dir.glob("*.txt"):
         split_name = split_file.stem
-        with open(split_file, "r") as f:
-            # Count non-empty lines in the file
-            papers = [line.strip() for line in f if line.strip()]
-            split_to_expected_papers[split_name] = len(papers)
+        split_to_expected_papers[split_name] = len(
+            load_paper_split(split_name, splits_dir=splits_dir)
+        )
 
     return split_to_expected_papers
 

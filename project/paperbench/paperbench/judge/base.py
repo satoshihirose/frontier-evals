@@ -12,6 +12,7 @@ from structlog.stdlib import BoundLogger
 
 from nanoeval.solvers.computer_tasks.code_execution_interface import ComputerInterface
 from paperbench.judge.graded_task_node import GradedTaskNode, score_from_children
+from paperbench.judge.leaf_checkpoint import LeafCheckpointStore
 from paperbench.judge.utils import file_exists, read_file_content, read_file_mtime, reduce_log
 from paperbench.rubric.tasks import TaskNode
 
@@ -30,6 +31,8 @@ class Judge(ABC):
         max_depth: int = 999,
         code_only: bool = False,
         computer: ComputerInterface | None = None,
+        leaf_checkpoint_store: LeafCheckpointStore | None = None,
+        max_invalid_leaf_retries: int = 3,
         *args: Any,
         **kwargs: Any,
     ) -> None:
@@ -42,6 +45,10 @@ class Judge(ABC):
         self.max_depth: int = max_depth
         self.code_only: bool = code_only
         self.computer = computer
+        self.leaf_checkpoint_store = leaf_checkpoint_store
+        if max_invalid_leaf_retries < 0:
+            raise ValueError("max_invalid_leaf_retries must be non-negative")
+        self.max_invalid_leaf_retries = max_invalid_leaf_retries
 
         # Reproduction script and log
         self.reproduce_sh_path: Path = self.submission_dir / "reproduce.sh"
@@ -66,6 +73,8 @@ class Judge(ABC):
         Separated from __init__ to allow for async operations.
         """
         await self.read_repro_files_content()
+        if self.leaf_checkpoint_store is not None:
+            await self.leaf_checkpoint_store.load()
 
     async def read_repro_files_content(self) -> None:
         """
@@ -112,6 +121,20 @@ class Judge(ABC):
         await self.before_grading()
 
         grade_leaf_fn = grade_leaf_fn or self.grade_leaf
+        if self.leaf_checkpoint_store is not None:
+            uncached_grade_leaf_fn = grade_leaf_fn
+
+            async def grade_leaf_with_checkpoint(task: TaskNode) -> GradedTaskNode:
+                assert self.leaf_checkpoint_store is not None
+                checkpoint = self.leaf_checkpoint_store.get(task)
+                if checkpoint is not None:
+                    logger.info(f"Reusing completed grade for leaf {task.id}")
+                    return checkpoint
+                graded = await uncached_grade_leaf_fn(task)
+                await self.leaf_checkpoint_store.save(task, graded)
+                return graded
+
+            grade_leaf_fn = grade_leaf_with_checkpoint
 
         if root_task is None:
             root_task = self.rubric
@@ -138,7 +161,7 @@ class Judge(ABC):
                 logger.info(f"Max depth reached for task {task.id}. Approximating entire subtree.")
                 return await self.grade_subtree(task)
             elif task.is_leaf():
-                return await grade_leaf_fn(task)
+                return await self._grade_leaf_with_retries(task, grade_leaf_fn)
         except openai.RateLimitError as e:
             logger.exception(f"Rate limit error while grading leaf {task.id}: {e}")
             raise
@@ -167,6 +190,40 @@ class Judge(ABC):
             explanation="Aggregated score from sub-tasks.",
             judge_metadata=None,
         )
+
+    async def _grade_leaf_with_retries(
+        self,
+        task: TaskNode,
+        grade_leaf_fn: Callable[[TaskNode], Awaitable[GradedTaskNode]],
+    ) -> GradedTaskNode:
+        """Retry transient invalid leaf results without recomputing valid checkpoints."""
+        for retry_number in range(self.max_invalid_leaf_retries + 1):
+            try:
+                graded = await grade_leaf_fn(task)
+            except openai.RateLimitError:
+                raise
+            except Exception as error:
+                if retry_number >= self.max_invalid_leaf_retries:
+                    raise
+                logger.warning(
+                    "Leaf grading failed; retrying",
+                    task_id=task.id,
+                    retry_number=retry_number + 1,
+                    max_retries=self.max_invalid_leaf_retries,
+                    error=str(error),
+                )
+                continue
+
+            if graded.valid_score or retry_number >= self.max_invalid_leaf_retries:
+                return graded
+            logger.warning(
+                "Leaf grading returned an invalid result; retrying",
+                task_id=task.id,
+                retry_number=retry_number + 1,
+                max_retries=self.max_invalid_leaf_retries,
+            )
+
+        raise AssertionError("unreachable leaf retry state")
 
     @abstractmethod
     async def grade_leaf(self, task: TaskNode) -> GradedTaskNode:

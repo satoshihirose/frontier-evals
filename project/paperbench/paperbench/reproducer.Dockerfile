@@ -19,12 +19,16 @@ RUN add-apt-repository ppa:deadsnakes/ppa && \
     apt-get update && \
     apt-get install -y \
         python3.11 python3.11-venv python3.11-dev \
-        python3.12 python3.12-venv python3.12-dev && \
+        python3.12 python3.12-venv python3.12-dev \
+        python3-pip jupyter && \
     rm -rf /var/lib/apt/lists/*
 
 # Set default python version to 3.12
 RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
 RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2
+RUN ln -s /usr/bin/python3 /usr/local/bin/python && \
+    ln -s /usr/bin/pip3 /usr/local/bin/pip
+RUN jupyter --version
 # users can switch to 3.11 by running `update-alternatives --set python3 /usr/bin/python3.11`
 
 # you would then
