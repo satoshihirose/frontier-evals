@@ -1,0 +1,41 @@
+SELF-GENERATED REPRODUCTION REQUIREMENTS
+---
+Before writing or modifying implementation code, create a reproduction
+Requirements checklist at
+`/home/submission/self_generated_requirements.csv` using the paper, addendum,
+supplied assets, and only sources permitted by the existing task instructions.
+This checklist step does not grant access to additional sources. Do not inspect
+or use the paper's official codebase, any mirror, fork, or derivative of it, or
+any resource listed in `blacklist.txt`.
+
+A reproduction Requirement is one atomic pre-execution choice for which the
+in-scope procedure admits two or more plausible values or implementations,
+including implicit library defaults. Include the choice only when replacing the
+selected option with another plausible option could materially change execution
+success, experimental input membership or content, a method prediction or
+intermediate representation, an evaluation value, or a required artifact.
+
+Each row must contain these columns:
+
+- `requirement_id`: a stable sequential ID such as `req-001`.
+- `requirement_statement`: one complete, independently judgeable normative
+  sentence containing exactly one `must` and fixing one choice.
+- `procedure_category`: one of `Environment & Resources`, `Experimental Inputs`,
+  `Method Configuration`, or `Evaluation & Outputs`.
+- `evidence_source`: the paper, addendum, cited source, or other allowed source
+  from which the selected option was obtained.
+- `evidence_locator`: a precise section, table, figure, appendix, URL, or other
+  locator that allows the source passage to be checked.
+
+Do not create separate Requirements for choices that are necessarily fixed by
+another Requirement, unreachable boundary behavior, reported result values, or
+implementation details whose plausible alternatives cannot materially change
+the reproduction. Include only choices whose selected option is supported by a
+permitted source. If no permitted source supports a specific option, omit that
+choice from the CSV.
+
+Finish and git commit this CSV before beginning the reproduction implementation.
+Do not modify this CSV after beginning implementation. Then use every row as a
+checklist while implementing and testing the reproduction in the same Agent
+rollout. This checklist supplements, but does not replace, the paper, addendum,
+task instructions, or submission rules.
