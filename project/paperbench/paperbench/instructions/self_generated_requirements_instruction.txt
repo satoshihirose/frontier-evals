@@ -3,10 +3,9 @@ SELF-GENERATED REPRODUCTION REQUIREMENTS
 Before writing or modifying implementation code, create a reproduction
 Requirements checklist at
 `/home/submission/self_generated_requirements.csv` using the paper, addendum,
-supplied assets, and only sources permitted by the existing task instructions.
-This checklist step does not grant access to additional sources. Do not inspect
-or use the paper's official codebase, any mirror, fork, or derivative of it, or
-any resource listed in `blacklist.txt`.
+supplied assets, and online resources. Do not inspect or use the paper's
+official codebase, any mirror, fork, or derivative of it, or any resource listed
+in `blacklist.txt`.
 
 A reproduction Requirement is one atomic pre-execution choice for which the
 in-scope procedure admits two or more plausible values or implementations,
