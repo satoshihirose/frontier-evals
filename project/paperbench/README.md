@@ -177,8 +177,9 @@ uv run python -m paperbench.nano.entrypoint \
 
 ### Codex CLI on semantic-self-consistency
 
-`semantic-poc` contains only the `semantic-self-consistency` development paper. The Codex
-agent image pins the CLI version at build time, while the solver records the actual version,
+Set `paperbench.paper_id=semantic-self-consistency` to select only that development paper; a
+custom single-paper split is not required. The Codex agent image pins the CLI version at build
+time, while the solver records the actual version,
 model, reasoning effort, reasoning-summary setting, wall-clock runtime, exit status, and raw
 JSONL events for each run. The solver requests `detailed` public reasoning summaries by default;
 when the selected model emits them, they appear as reasoning items in `agent.log`. These are
@@ -195,8 +196,8 @@ keys, passwords, secrets, signatures, or tokens are replaced with `REDACTED`. A
 `command_text` record means that a URL appeared in a command; it does not by itself prove that
 the command successfully connected to that URL. Network requests made internally by package
 managers or libraries remain outside this file unless Codex exposes their URLs in an event.
-Only the Codex CLI is added to the agent image. The Python solver and split remain in the host
-checkout, where PaperBench loads them and controls the container lifecycle. Because Codex uses
+Only the Codex CLI is added to the agent image. The Python solver and paper selection remain in
+the host checkout, where PaperBench controls the container lifecycle. Because Codex uses
 shell commands directly, `CodexSolver` defaults to PaperBench's shell-only Alcatraz runtime.
 Before `codex exec` starts, the solver passes the unchanged non-iterative BasicAgent system
 message selected for the current `code_only` setting through Codex's `developer_instructions`
@@ -235,7 +236,7 @@ git -c lfs.fetchexclude= lfs pull \
 bash paperbench/scripts/build-docker-images.sh
 
 uv run python -m paperbench.nano.entrypoint \
-    paperbench.paper_split=semantic-poc \
+    paperbench.paper_id=semantic-self-consistency \
     paperbench.docker_image=pb-codex-env:latest \
     paperbench.solver=paperbench.solvers.codex.solver:CodexSolver \
     paperbench.solver.codex_auth_file='~/.codex/auth.json' \
@@ -293,9 +294,10 @@ resuming a rollout created under another input condition would not be a valid co
 
 Keep the `frontier-evals` checkout under `/data/$USER` on roemia. The
 [`run-paperbench-roemia.sh`](paperbench/scripts/run-paperbench-roemia.sh) launcher runs one full
-PoC task selected by `--paper`. Supported paper IDs are `bam`, `bbox`, and
-`semantic-self-consistency`; the launcher maps them to the existing PaperBench single-paper
-splits and does not change task logic. Docker images remain in Docker's configured data root,
+PoC task selected by `--paper`. The launcher accepts aliases listed in
+[`experiments/paper-aliases.tsv`](experiments/paper-aliases.tsv) and passes the resulting paper
+ID directly to PaperBench. The registry contains every PaperBench paper, so adding a per-paper
+split file is unnecessary. Docker images remain in Docker's configured data root,
 while host run artifacts are written to `/data/$USER/paperbench/runs`. The launcher bind-mounts
 `/data/$USER/paperbench/cache` at `/root/.cache` in both the Codex agent and reproduction
 containers, and uses separate `/data`-backed `/tmp` directories for the two stages. This keeps

@@ -12,9 +12,9 @@ Low-level launcher for one PaperBench PoC task on a GPU server. Normal end-to-en
 runs must use ReproGapBench's run_paperbench_with_qwen_judge.sh. Pass
 --standalone explicitly only when intentionally skipping that Qwen chain.
 
-PAPER must have a matching single-paper `*-poc.txt` file under
-experiments/splits. Adding that file is sufficient to make a new task
-available to this launcher.
+PAPER must be an alias listed in experiments/paper-aliases.tsv. The launcher
+resolves the alias to a PaperBench paper ID and selects that paper directly;
+per-paper split files are not required.
 
 Docker images remain in Docker's data root; run artifacts, package/model caches,
 and container temporary files are stored below the configured data mount.
@@ -98,29 +98,27 @@ fi
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 paperbench_root="$(cd -- "$script_dir/../.." && pwd)"
-splits_dir="$paperbench_root/experiments/splits"
-paper_split=""
-for split_path in "$splits_dir"/*-poc.txt; do
-  [[ -f "$split_path" ]] || continue
-  split_paper_count="$(grep -c '[^[:space:]]' "$split_path" || true)"
-  [[ "$split_paper_count" == 1 ]] || continue
-  split_paper="$(
-    sed -n \
-      '/[^[:space:]]/{s/^[[:space:]]*//;s/[[:space:]]*$//;p;q;}' \
-      "$split_path"
-  )"
-  [[ "$split_paper" == "$paper" ]] || continue
-  discovered_split="$(basename -- "$split_path" .txt)"
-  if [[ -n "$paper_split" ]]; then
-    printf 'Paper %s appears in multiple single-paper PoC splits: %s, %s\n' \
-      "$paper" "$paper_split" "$discovered_split" >&2
-    exit 2
+paper_registry="$paperbench_root/experiments/paper-aliases.tsv"
+if [[ ! -f "$paper_registry" ]]; then
+  printf 'Paper alias registry does not exist: %s\n' "$paper_registry" >&2
+  exit 1
+fi
+paper_id=""
+while IFS=$'\t' read -r registered_alias registered_paper_id extra; do
+  [[ -n "$registered_alias" && "${registered_alias:0:1}" != "#" ]] || continue
+  if [[ -z "$registered_paper_id" || -n "${extra:-}" ]]; then
+    printf 'Invalid paper alias registry row for alias %s\n' "$registered_alias" >&2
+    exit 1
   fi
-  paper_split="$discovered_split"
-done
-if [[ -z "$paper_split" ]]; then
-  printf 'Unsupported paper: %s (no matching single-paper PoC split file)\n' \
-    "$paper" >&2
+  [[ "$registered_alias" == "$paper" ]] || continue
+  if [[ -n "$paper_id" ]]; then
+    printf 'Duplicate paper alias in registry: %s\n' "$paper" >&2
+    exit 1
+  fi
+  paper_id="$registered_paper_id"
+done < "$paper_registry"
+if [[ -z "$paper_id" ]]; then
+  printf 'Unsupported paper alias: %s\n' "$paper" >&2
   usage >&2
   exit 2
 fi
@@ -313,7 +311,7 @@ fi
 
 command=(
   uv run python -m paperbench.nano.entrypoint
-  paperbench.paper_split="$paper_split"
+  paperbench.paper_id="$paper_id"
   paperbench.runs_dir="$runs_dir"
   paperbench.docker_image=pb-codex-env:latest
   paperbench.solver=paperbench.solvers.codex.solver:CodexSolver

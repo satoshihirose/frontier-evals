@@ -110,28 +110,28 @@ def test_roemia_launcher_requires_explicit_standalone_mode() -> None:
     assert "--standalone" in result.stderr
 
 
-def test_roemia_launcher_discovers_new_single_paper_split_from_file(
+def test_roemia_launcher_discovers_new_paper_alias_from_registry(
     tmp_path: Path,
 ) -> None:
     source_launcher = get_root() / "scripts" / "run-paperbench-roemia.sh"
     paperbench_root = tmp_path / "paperbench"
     scripts_dir = paperbench_root / "paperbench" / "scripts"
-    splits_dir = paperbench_root / "experiments" / "splits"
+    experiments_dir = paperbench_root / "experiments"
     scripts_dir.mkdir(parents=True)
-    splits_dir.mkdir(parents=True)
+    experiments_dir.mkdir(parents=True)
     launcher = scripts_dir / source_launcher.name
     shutil.copy2(source_launcher, launcher)
     materializer = scripts_dir / "materialize-paper-assets.sh"
     materializer.write_text("#!/usr/bin/env bash\nexit 0\n")
     materializer.chmod(0o755)
-    (splits_dir / "new-paper-poc.txt").write_text("new-paper\n")
+    (experiments_dir / "paper-aliases.tsv").write_text("new\tnew-paper\n")
     auth_file = tmp_path / "auth.json"
     agent_env = tmp_path / "agent.env"
     auth_file.write_text("{}\n")
     agent_env.write_text("OPENAI_API_KEY=test-placeholder\n")
 
     result = subprocess.run(
-        [str(launcher), "--dry-run", "--paper", "new-paper"],
+        [str(launcher), "--dry-run", "--paper", "new"],
         check=True,
         capture_output=True,
         text=True,
@@ -143,7 +143,8 @@ def test_roemia_launcher_discovers_new_single_paper_split_from_file(
         },
     )
 
-    assert "paperbench.paper_split=new-paper-poc" in result.stdout
+    assert "paperbench.paper_id=new-paper" in result.stdout
+    assert "paperbench.paper_split=" not in result.stdout
 
 
 def test_roemia_launcher_externalizes_runs_cache_and_tmp(tmp_path: Path) -> None:
@@ -194,7 +195,7 @@ def test_roemia_launcher_externalizes_runs_cache_and_tmp(tmp_path: Path) -> None
         command.count("paperbench.reproduction.computer_runtime.env.gpu_device_id=")
         == 1
     )
-    assert "paperbench.paper_split=bam-poc" in command
+    assert "paperbench.paper_id=bam" in command
     assert "paperbench.judge.code_only=False" in command
     assert "paperbench.reproduction.skip_reproduction=False" in command
     assert "paperbench.solver.persist_refreshed_auth=true" in command
@@ -255,7 +256,7 @@ def test_roemia_launcher_dry_run_does_not_require_credentials(
         },
     )
 
-    assert "paperbench.paper_split=bam-poc" in result.stdout
+    assert "paperbench.paper_id=bam" in result.stdout
 
 
 def test_roemia_launcher_adds_requirements_only_when_requested(tmp_path: Path) -> None:
@@ -376,24 +377,25 @@ def test_roemia_launcher_rejects_unknown_paper(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 2
-    assert "Unsupported paper: unknown" in result.stderr
+    assert "Unsupported paper alias: unknown" in result.stderr
 
 
 @pytest.mark.parametrize(
-    ("paper", "paper_split"),
+    ("paper_alias", "paper_id"),
     [
-        ("adaptive-pruning", "adaptive-pruning-poc"),
-        ("bam", "bam-poc"),
-        ("bbox", "bbox-poc"),
-        ("mechanistic-understanding", "mechanistic-understanding-poc"),
-        ("semantic-self-consistency", "semantic-poc"),
-        ("stochastic-interpolants", "stochastic-interpolants-poc"),
+        ("adaptive-pruning", "adaptive-pruning"),
+        ("bam", "bam"),
+        ("bbox", "bbox"),
+        ("mechanistic-understanding", "mechanistic-understanding"),
+        ("semantic", "semantic-self-consistency"),
+        ("semantic-self-consistency", "semantic-self-consistency"),
+        ("stochastic-interpolants", "stochastic-interpolants"),
     ],
 )
-def test_roemia_launcher_maps_supported_paper_to_single_paper_split(
+def test_roemia_launcher_resolves_paper_alias_to_direct_paper_id(
     tmp_path: Path,
-    paper: str,
-    paper_split: str,
+    paper_alias: str,
+    paper_id: str,
 ) -> None:
     launcher = get_root() / "scripts" / "run-paperbench-roemia.sh"
     auth_file = tmp_path / "auth.json"
@@ -402,7 +404,7 @@ def test_roemia_launcher_maps_supported_paper_to_single_paper_split(
     agent_env.write_text("OPENAI_API_KEY=test-placeholder\n")
 
     result = subprocess.run(
-        [str(launcher), "--dry-run", "--paper", paper],
+        [str(launcher), "--dry-run", "--paper", paper_alias],
         check=True,
         capture_output=True,
         text=True,
@@ -414,7 +416,7 @@ def test_roemia_launcher_maps_supported_paper_to_single_paper_split(
         },
     )
 
-    assert f"paperbench.paper_split={paper_split}" in result.stdout
+    assert f"paperbench.paper_id={paper_id}" in result.stdout
 
 
 def test_alcatraz_limits_nvidia_container_to_configured_gpu() -> None:

@@ -1,4 +1,5 @@
 import os
+import re
 from typing import Any, Sequence
 
 import blobfile as bf
@@ -49,6 +50,7 @@ GRADER_OPENAI_API_KEY = os.getenv("GRADER_OPENAI_API_KEY") or os.getenv("OPENAI_
 
 
 logger = structlog.stdlib.get_logger(component=__name__)
+PAPER_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 
 def requires_grader_openai_api_key(completer_config: object) -> bool:
@@ -67,6 +69,12 @@ class PaperBench(PythonCodingEval):
         doc=(
             "Name of a text file in experiments/splits, without the '.txt' suffix. "
             "Each non-empty line in that file is a PaperBench paper ID."
+        ),
+    )
+    paper_id: str | None = chz.field(
+        default=None,
+        doc=(
+            "Run exactly one PaperBench paper ID. When set, this takes precedence over paper_split."
         ),
     )
     resume_run_group_id: str | None = chz.field(default=None)
@@ -116,6 +124,15 @@ class PaperBench(PythonCodingEval):
             assert self.resume_run_group_id.strip() != "", (
                 "resume_run_group_id is empty, did you set it correctly?"
             )
+        if self.paper_id is not None:
+            assert PAPER_ID_PATTERN.fullmatch(self.paper_id), (
+                f"Invalid PaperBench paper ID: {self.paper_id!r}"
+            )
+
+    def selected_paper_ids(self) -> list[str]:
+        if self.paper_id is not None:
+            return [self.paper_id]
+        return load_paper_split(self.paper_split)
 
     @override
     async def get_instances(self) -> list[PBTask]:
@@ -135,7 +152,7 @@ class PaperBench(PythonCodingEval):
             _print=True,
         )
 
-        paper_ids = load_paper_split(self.paper_split)
+        paper_ids = self.selected_paper_ids()
 
         existing_run_ids = set()
         if self.resume_run_group_id is not None:
@@ -244,6 +261,7 @@ class PaperBench(PythonCodingEval):
 
         # params
         params = {
+            "paper_id": self.paper_id,
             "paper_split": self.paper_split,
             "n_tries": self.n_tries,
             "n_samples": len(results),
@@ -281,7 +299,7 @@ class PaperBench(PythonCodingEval):
         }
 
         eval_runs = gather_eval_runs(results_clean, self.n_tries)
-        expected_papers = len(load_paper_split(self.paper_split))
+        expected_papers = len(self.selected_paper_ids())
         overall_results = compute_agg_stats(eval_runs, expected_papers=expected_papers)
         mean_score_by_paper = per_paper_results(eval_runs, self.n_tries)
 
@@ -389,14 +407,14 @@ class PaperBench(PythonCodingEval):
 
     def check_for_lfs(self) -> None:
         """
-        Ensure required papers for the selected split are hydrated from LFS.
+        Ensure required papers for the direct paper ID or selected split are hydrated from LFS.
 
-        We only validate papers that appear in the active ``paper_split`` to allow
+        We only validate papers selected for this evaluation to allow
         lightweight CI runs that hydrate a minimal subset of the dataset.
         """
 
         papers_dir = get_paperbench_data_dir() / "papers"
-        paper_ids = load_paper_split(self.paper_split)
+        paper_ids = self.selected_paper_ids()
 
         for paper_id in paper_ids:
             paper_path = papers_dir / paper_id / "paper.md"
