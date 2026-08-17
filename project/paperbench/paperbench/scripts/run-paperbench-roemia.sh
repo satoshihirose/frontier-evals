@@ -23,6 +23,15 @@ Environment overrides:
   PAPERBENCH_DATA_BASE   Host data mount (default: /data)
   PAPERBENCH_DATA_ROOT   Host data directory below PAPERBENCH_DATA_BASE
   PAPERBENCH_GPU_DEVICE  GPU index or UUID (default: select one idle GPU)
+  PAPERBENCH_AGENT_GPU_NAME_PATTERN
+                         Restrict automatic selection to matching GPU names
+  PAPERBENCH_AGENT_MIN_GPU_MEMORY_MIB
+                         Minimum total GPU memory for automatic selection
+                         (default: 0)
+  PAPERBENCH_AGENT_GPU_WAIT_TIMEOUT_SECONDS
+                         GPU wait timeout (default: 21600 / 6 hours)
+  PAPERBENCH_AGENT_GPU_POLL_INTERVAL_SECONDS
+                         GPU recheck interval (default: 60 / 1 minute)
   CODEX_AUTH_FILE       Host Codex auth source copied into an isolated per-run
                         directory (default: $HOME/.codex/auth.json)
   PAPERBENCH_AGENT_ENV  PaperBench agent.env used by the checkout
@@ -33,6 +42,10 @@ dry_run=false
 launch_mode=""
 requirements_csv=""
 requested_gpu="${PAPERBENCH_GPU_DEVICE:-}"
+gpu_name_pattern="${PAPERBENCH_AGENT_GPU_NAME_PATTERN:-}"
+minimum_gpu_memory_mib="${PAPERBENCH_AGENT_MIN_GPU_MEMORY_MIB:-0}"
+gpu_wait_timeout="${PAPERBENCH_AGENT_GPU_WAIT_TIMEOUT_SECONDS:-21600}"
+gpu_poll_interval="${PAPERBENCH_AGENT_GPU_POLL_INTERVAL_SECONDS:-60}"
 paper=""
 extra_args=()
 while (($#)); do
@@ -93,6 +106,21 @@ done
 if [[ -z "$paper" ]]; then
   printf '%s\n' '--paper is required.' >&2
   usage >&2
+  exit 2
+fi
+if [[ ! "$gpu_wait_timeout" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'Invalid PAPERBENCH_AGENT_GPU_WAIT_TIMEOUT_SECONDS: %s\n' \
+    "$gpu_wait_timeout" >&2
+  exit 2
+fi
+if [[ ! "$gpu_poll_interval" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'Invalid PAPERBENCH_AGENT_GPU_POLL_INTERVAL_SECONDS: %s\n' \
+    "$gpu_poll_interval" >&2
+  exit 2
+fi
+if [[ ! "$minimum_gpu_memory_mib" =~ ^[0-9]+$ ]]; then
+  printf 'Invalid PAPERBENCH_AGENT_MIN_GPU_MEMORY_MIB: %s\n' \
+    "$minimum_gpu_memory_mib" >&2
   exit 2
 fi
 
@@ -195,12 +223,18 @@ select_gpu() {
   local active_gpu_uuids
   local index
   local uuid
+  local name
+  local total_memory
   local free_memory
-  local candidate_fd
+  local requested_gpu_found=false
+
+  gpu_device_id=""
+  gpu_index=""
+  gpu_free_memory=""
 
   inventory="$(
     nvidia-smi \
-      --query-gpu=index,uuid,memory.free \
+      --query-gpu=index,uuid,name,memory.total,memory.free \
       --format=csv,noheader,nounits
   )"
   active_gpu_uuids="$(
@@ -217,27 +251,18 @@ select_gpu() {
     if [[ -n "$requested_gpu" && "$requested_gpu" != "$index" && "$requested_gpu" != "$uuid" ]]; then
       continue
     fi
+    requested_gpu_found=true
     if grep -Fxq "$uuid" <<<"$active_gpu_uuids"; then
-      if [[ -n "$requested_gpu" ]]; then
-        printf 'Requested GPU is already running a compute process: %s (%s)\n' \
-          "$index" "$uuid" >&2
-        return 1
-      fi
       continue
     fi
 
     if [[ "$acquire_lock" == true ]]; then
-      exec {candidate_fd}>"$gpu_lock_dir/$uuid.lock"
-      if ! flock -n "$candidate_fd"; then
-        eval "exec ${candidate_fd}>&-"
-        if [[ -n "$requested_gpu" ]]; then
-          printf 'Requested GPU is reserved by another PaperBench launcher: %s (%s)\n' \
-            "$index" "$uuid" >&2
-          return 1
-        fi
+      exec 9>"$gpu_lock_dir/$uuid.lock"
+      if ! flock -n 9; then
+        exec 9>&-
         continue
       fi
-      gpu_lock_fd="$candidate_fd"
+      gpu_lock_fd=9
     fi
 
     gpu_device_id="$uuid"
@@ -245,19 +270,25 @@ select_gpu() {
     gpu_free_memory="$free_memory"
     break
   done < <(
-    while IFS=',' read -r index uuid free_memory; do
+    while IFS=',' read -r index uuid name total_memory free_memory; do
       index="$(trim_whitespace "$index")"
       uuid="$(trim_whitespace "$uuid")"
+      name="$(trim_whitespace "$name")"
+      total_memory="$(trim_whitespace "$total_memory")"
       free_memory="$(trim_whitespace "$free_memory")"
+      if [[ -n "$gpu_name_pattern" && "$name" != *"$gpu_name_pattern"* ]]; then
+        continue
+      fi
+      if ((total_memory < minimum_gpu_memory_mib)); then
+        continue
+      fi
       printf '%s,%s,%s\n' "$free_memory" "$index" "$uuid"
     done <<<"$inventory" | sort -t, -k1,1nr
   )
 
   if [[ -z "$gpu_device_id" ]]; then
-    if [[ -n "$requested_gpu" ]]; then
-      printf 'Requested GPU was not found or is unavailable: %s\n' "$requested_gpu" >&2
-    else
-      printf 'No idle, unlocked NVIDIA GPU is available.\n' >&2
+    if [[ -n "$requested_gpu" && "$requested_gpu_found" == false ]]; then
+      return 2
     fi
     return 1
   fi
@@ -266,9 +297,69 @@ select_gpu() {
     "$gpu_index" "$gpu_device_id" "$gpu_free_memory" >&2
 }
 
+wait_for_gpu() {
+  local wait_started="$SECONDS"
+  local wait_elapsed
+  local wait_remaining
+  local next_interval
+  local selection_status
+  local wait_description
+
+  if [[ -n "$requested_gpu" ]]; then
+    wait_description="requested GPU $requested_gpu"
+  elif [[ -n "$gpu_name_pattern" && "$minimum_gpu_memory_mib" != 0 ]]; then
+    wait_description="an idle, unlocked $gpu_name_pattern GPU with at least $minimum_gpu_memory_mib MiB total memory"
+  elif [[ -n "$gpu_name_pattern" ]]; then
+    wait_description="an idle, unlocked $gpu_name_pattern GPU"
+  elif [[ "$minimum_gpu_memory_mib" != 0 ]]; then
+    wait_description="an idle, unlocked NVIDIA GPU with at least $minimum_gpu_memory_mib MiB total memory"
+  else
+    wait_description="an idle, unlocked NVIDIA GPU"
+  fi
+
+  while true; do
+    if select_gpu true; then
+      return 0
+    else
+      selection_status=$?
+    fi
+    if ((selection_status == 2)); then
+      printf 'Requested GPU was not found: %s\n' "$requested_gpu" >&2
+      return 1
+    fi
+
+    wait_elapsed="$((SECONDS - wait_started))"
+    if ((wait_elapsed >= gpu_wait_timeout)); then
+      printf 'Timed out after %s second(s) waiting for %s.\n' \
+        "$gpu_wait_timeout" "$wait_description" >&2
+      return 124
+    fi
+
+    wait_remaining="$((gpu_wait_timeout - wait_elapsed))"
+    next_interval="$gpu_poll_interval"
+    if ((next_interval > wait_remaining)); then
+      next_interval="$wait_remaining"
+    fi
+    printf '[%s] Waiting for %s; elapsed %s second(s), checking again in %s second(s).\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      "$wait_description" \
+      "$wait_elapsed" \
+      "$next_interval" >&2
+    sleep "$next_interval"
+  done
+}
+
 if $dry_run; then
   if command -v nvidia-smi >/dev/null 2>&1; then
-    select_gpu false
+    if ! select_gpu false; then
+      if [[ -n "$requested_gpu" ]]; then
+        printf 'Requested GPU was not found or is unavailable: %s\n' \
+          "$requested_gpu" >&2
+      else
+        printf 'No idle NVIDIA GPU is available.\n' >&2
+      fi
+      exit 1
+    fi
   else
     gpu_device_id="${requested_gpu:-AUTO_FREE_GPU}"
   fi
@@ -306,7 +397,7 @@ else
     rm -rf -- "$runtime_codex_home"
   }
   trap cleanup_runtime_auth EXIT
-  select_gpu true
+  wait_for_gpu
 fi
 
 command=(

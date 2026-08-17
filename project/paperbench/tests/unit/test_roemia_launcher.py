@@ -117,8 +117,10 @@ def test_roemia_launcher_discovers_new_paper_alias_from_registry(
     paperbench_root = tmp_path / "paperbench"
     scripts_dir = paperbench_root / "paperbench" / "scripts"
     experiments_dir = paperbench_root / "experiments"
+    paper_dir = paperbench_root / "data" / "papers" / "new-paper"
     scripts_dir.mkdir(parents=True)
     experiments_dir.mkdir(parents=True)
+    paper_dir.mkdir(parents=True)
     launcher = scripts_dir / source_launcher.name
     shutil.copy2(source_launcher, launcher)
     materializer = scripts_dir / "materialize-paper-assets.sh"
@@ -145,6 +147,92 @@ def test_roemia_launcher_discovers_new_paper_alias_from_registry(
 
     assert "paperbench.paper_id=new-paper" in result.stdout
     assert "paperbench.paper_split=" not in result.stdout
+
+
+def test_roemia_launcher_waits_when_selected_gpu_lock_is_contended(
+    tmp_path: Path,
+) -> None:
+    source_launcher = get_root() / "scripts" / "run-paperbench-roemia.sh"
+    paperbench_root = tmp_path / "paperbench"
+    scripts_dir = paperbench_root / "paperbench" / "scripts"
+    experiments_dir = paperbench_root / "experiments"
+    fake_bin = tmp_path / "bin"
+    scripts_dir.mkdir(parents=True)
+    experiments_dir.mkdir(parents=True)
+    fake_bin.mkdir()
+    launcher = scripts_dir / source_launcher.name
+    shutil.copy2(source_launcher, launcher)
+    materializer = scripts_dir / "materialize-paper-assets.sh"
+    materializer.write_text("#!/usr/bin/env bash\nexit 0\n")
+    materializer.chmod(0o755)
+    (experiments_dir / "paper-aliases.tsv").write_text("new-paper\tnew-paper\n")
+    auth_file = tmp_path / "auth.json"
+    agent_env = tmp_path / "agent.env"
+    auth_file.write_text("{}\n")
+    agent_env.write_text("OPENAI_API_KEY=test-placeholder\n")
+    lock_attempts = tmp_path / "lock-attempts"
+    lock_attempts.write_text("0\n")
+
+    fake_nvidia_smi = fake_bin / "nvidia-smi"
+    fake_nvidia_smi.write_text(
+        "#!/usr/bin/env bash\n"
+        "case \"$*\" in\n"
+        "  *--query-gpu=index,uuid,name,memory.total,memory.free*)\n"
+        "    printf '%s\\n' '0, GPU-selected, NVIDIA H200 NVL, 143771, 140000' ;;\n"
+        "  *--query-compute-apps=gpu_uuid*) ;;\n"
+        "  *) exit 2 ;;\n"
+        "esac\n"
+    )
+    fake_nvidia_smi.chmod(0o755)
+    fake_flock = fake_bin / "flock"
+    fake_flock.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "if [[ \"${1:-}\" == -n ]]; then\n"
+        "  count=\"$(cat \"$MOCK_LOCK_ATTEMPTS\")\"\n"
+        "  count=\"$((count + 1))\"\n"
+        "  printf '%s\\n' \"$count\" > \"$MOCK_LOCK_ATTEMPTS\"\n"
+        "  ((count > 1))\n"
+        "  exit\n"
+        "fi\n"
+        "exit 0\n"
+    )
+    fake_flock.chmod(0o755)
+    fake_uv = fake_bin / "uv"
+    fake_uv.write_text("#!/usr/bin/env bash\nexit 0\n")
+    fake_uv.chmod(0o755)
+
+    data_base = tmp_path / "data-base"
+    data_base.mkdir()
+    result = subprocess.run(
+        [
+            str(launcher),
+            "--standalone",
+            "--paper",
+            "new-paper",
+            "--gpu",
+            "GPU-selected",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "PAPERBENCH_DATA_BASE": str(data_base),
+            "PAPERBENCH_DATA_ROOT": str(data_base / "paperbench"),
+            "CODEX_AUTH_FILE": str(auth_file),
+            "PAPERBENCH_AGENT_ENV": str(agent_env),
+            "MOCK_LOCK_ATTEMPTS": str(lock_attempts),
+            "PAPERBENCH_AGENT_GPU_WAIT_TIMEOUT_SECONDS": "5",
+            "PAPERBENCH_AGENT_GPU_POLL_INTERVAL_SECONDS": "1",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Waiting for requested GPU GPU-selected" in result.stderr
+    assert "Selected GPU 0 (GPU-selected" in result.stderr
+    assert int(lock_attempts.read_text()) >= 2
 
 
 def test_roemia_launcher_externalizes_runs_cache_and_tmp(tmp_path: Path) -> None:
@@ -320,11 +408,11 @@ case "$*" in
   *--query-compute-apps=gpu_uuid*)
     printf '%s\\n' GPU-busy
     ;;
-  *--query-gpu=index,uuid,memory.free*)
+  *--query-gpu=index,uuid,name,memory.total,memory.free*)
     printf '%s\\n' \
-      '0, GPU-busy, 70000' \
-      '1, GPU-idle-smaller, 60000' \
-      '2, GPU-idle-largest, 80000'
+      '0, GPU-busy, NVIDIA A100 80GB PCIe, 81920, 70000' \
+      '1, GPU-idle-smaller, NVIDIA A100 80GB PCIe, 81920, 60000' \
+      '2, GPU-idle-largest, NVIDIA A100 80GB PCIe, 81920, 80000'
     ;;
   *)
     exit 2
@@ -354,6 +442,96 @@ esac
         )
         == 2
     )
+
+
+def test_roemia_launcher_reselects_a_qualified_gpu_while_waiting(
+    tmp_path: Path,
+) -> None:
+    source_launcher = get_root() / "scripts" / "run-paperbench-roemia.sh"
+    paperbench_root = tmp_path / "paperbench"
+    scripts_dir = paperbench_root / "paperbench" / "scripts"
+    experiments_dir = paperbench_root / "experiments"
+    fake_bin = tmp_path / "bin"
+    scripts_dir.mkdir(parents=True)
+    experiments_dir.mkdir(parents=True)
+    fake_bin.mkdir()
+    launcher = scripts_dir / source_launcher.name
+    shutil.copy2(source_launcher, launcher)
+    materializer = scripts_dir / "materialize-paper-assets.sh"
+    materializer.write_text("#!/usr/bin/env bash\nexit 0\n")
+    materializer.chmod(0o755)
+    (experiments_dir / "paper-aliases.tsv").write_text("new-paper\tnew-paper\n")
+    auth_file = tmp_path / "auth.json"
+    agent_env = tmp_path / "agent.env"
+    auth_file.write_text("{}\n")
+    agent_env.write_text("OPENAI_API_KEY=test-placeholder\n")
+    gpu_state = tmp_path / "gpu-state"
+    gpu_state.write_text("0\n")
+
+    fake_nvidia_smi = fake_bin / "nvidia-smi"
+    fake_nvidia_smi.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "case \"$*\" in\n"
+        "  *--query-gpu=index,uuid,name,memory.total,memory.free*)\n"
+        "    count=\"$(cat \"$MOCK_GPU_STATE\")\"\n"
+        "    count=\"$((count + 1))\"\n"
+        "    printf '%s\\n' \"$count\" > \"$MOCK_GPU_STATE\"\n"
+        "    printf '%s\\n' \\\n"
+        "      '0, GPU-first, NVIDIA A100 80GB PCIe, 81920, 81000' \\\n"
+        "      '1, GPU-second, NVIDIA A100 80GB PCIe, 81920, 80000' \\\n"
+        "      '2, GPU-40gb, NVIDIA A100-PCIE-40GB, 40960, 40000' ;;\n"
+        "  *--query-compute-apps=gpu_uuid*)\n"
+        "    count=\"$(cat \"$MOCK_GPU_STATE\")\"\n"
+        "    if ((count == 1)); then\n"
+        "      printf '%s\\n' GPU-first GPU-second\n"
+        "    else\n"
+        "      printf '%s\\n' GPU-first\n"
+        "    fi ;;\n"
+        "  *) exit 2 ;;\n"
+        "esac\n"
+    )
+    fake_nvidia_smi.chmod(0o755)
+    fake_flock = fake_bin / "flock"
+    fake_flock.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "case \"${1:-}\" in -n|-u) shift ;; esac\n"
+        "if [[ \"${1:-}\" =~ ^[0-9]+$ ]]; then exit 0; fi\n"
+        "shift\n"
+        "exec \"$@\"\n"
+    )
+    fake_flock.chmod(0o755)
+    fake_uv = fake_bin / "uv"
+    fake_uv.write_text("#!/usr/bin/env bash\nexit 0\n")
+    fake_uv.chmod(0o755)
+
+    data_base = tmp_path / "data-base"
+    data_base.mkdir()
+    result = subprocess.run(
+        [str(launcher), "--standalone", "--paper", "new-paper"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "PAPERBENCH_DATA_BASE": str(data_base),
+            "PAPERBENCH_DATA_ROOT": str(data_base / "paperbench"),
+            "PAPERBENCH_AGENT_GPU_NAME_PATTERN": "A100 80GB",
+            "PAPERBENCH_AGENT_MIN_GPU_MEMORY_MIB": "80000",
+            "PAPERBENCH_AGENT_GPU_WAIT_TIMEOUT_SECONDS": "5",
+            "PAPERBENCH_AGENT_GPU_POLL_INTERVAL_SECONDS": "1",
+            "CODEX_AUTH_FILE": str(auth_file),
+            "PAPERBENCH_AGENT_ENV": str(agent_env),
+            "MOCK_GPU_STATE": str(gpu_state),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Waiting for an idle, unlocked A100 80GB GPU" in result.stderr
+    assert "Selected GPU 1 (GPU-second" in result.stderr
+    assert "GPU-40gb" not in result.stdout
 
 
 def test_roemia_launcher_rejects_unknown_paper(tmp_path: Path) -> None:
