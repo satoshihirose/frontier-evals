@@ -108,6 +108,22 @@ if [[ -z "$paper" ]]; then
   usage >&2
   exit 2
 fi
+
+solver_override=""
+if ((${#extra_args[@]})); then
+  for extra_arg in "${extra_args[@]}"; do
+    case "$extra_arg" in
+      paperbench.solver=*)
+        solver_override="${extra_arg#paperbench.solver=}"
+        ;;
+    esac
+  done
+fi
+use_codex_solver_defaults=false
+if [[ -z "$solver_override" || \
+  "$solver_override" == "paperbench.solvers.codex.solver:CodexSolver" ]]; then
+  use_codex_solver_defaults=true
+fi
 if [[ ! "$gpu_wait_timeout" =~ ^[1-9][0-9]*$ ]]; then
   printf 'Invalid PAPERBENCH_AGENT_GPU_WAIT_TIMEOUT_SECONDS: %s\n' \
     "$gpu_wait_timeout" >&2
@@ -405,12 +421,6 @@ command=(
   paperbench.paper_id="$paper_id"
   paperbench.runs_dir="$runs_dir"
   paperbench.docker_image=pb-codex-env:latest
-  paperbench.solver=paperbench.solvers.codex.solver:CodexSolver
-  paperbench.solver.codex_auth_file="$runtime_auth_file"
-  paperbench.solver.persist_refreshed_auth=true
-  paperbench.solver.model=gpt-5.6-sol
-  paperbench.solver.reasoning_effort=high
-  paperbench.solver.reasoning_summary=detailed
   paperbench.solver.time_limit=86400
   paperbench.solver.upload_interval_seconds=1800
   paperbench.solver.computer_runtime.env=alcatraz.clusters.local:LocalConfig
@@ -448,6 +458,17 @@ command=(
   runner.concurrency=1
   runner.recorder=nanoeval.json_recorder:json_recorder
 )
+
+if $use_codex_solver_defaults; then
+  command+=(
+    paperbench.solver=paperbench.solvers.codex.solver:CodexSolver
+    paperbench.solver.codex_auth_file="$runtime_auth_file"
+    paperbench.solver.persist_refreshed_auth=true
+    paperbench.solver.model=gpt-5.6-sol
+    paperbench.solver.reasoning_effort=high
+    paperbench.solver.reasoning_summary=detailed
+  )
+fi
 
 if [[ -n "$requirements_csv" ]]; then
   command+=(paperbench.requirements_csv="$requirements_csv")

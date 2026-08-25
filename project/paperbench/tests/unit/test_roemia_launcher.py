@@ -298,6 +298,45 @@ def test_roemia_launcher_externalizes_runs_cache_and_tmp(tmp_path: Path) -> None
     assert "test-placeholder" not in command
 
 
+def test_roemia_launcher_omits_codex_only_options_for_custom_solver(
+    tmp_path: Path,
+) -> None:
+    launcher = get_root() / "scripts" / "run-paperbench-roemia.sh"
+    data_root = tmp_path / "paperbench-data"
+    auth_file = tmp_path / "auth.json"
+    agent_env = tmp_path / "agent.env"
+    auth_file.write_text("{}\n")
+    agent_env.write_text("OPENAI_API_KEY=test-placeholder\n")
+
+    custom_solver = "example.solver:CustomSolver"
+    result = subprocess.run(
+        [
+            str(launcher),
+            "--dry-run",
+            "--paper",
+            "bam",
+            "--",
+            f"paperbench.solver={custom_solver}",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PAPERBENCH_DATA_ROOT": str(data_root),
+            "CODEX_AUTH_FILE": str(auth_file),
+            "PAPERBENCH_AGENT_ENV": str(agent_env),
+        },
+    )
+
+    command = result.stdout
+    assert f"paperbench.solver={custom_solver}" in command
+    assert "paperbench.solver.codex_auth_file=" not in command
+    assert "paperbench.solver.persist_refreshed_auth=" not in command
+    assert "paperbench.solver.reasoning_summary=" not in command
+    assert "paperbench.solver.time_limit=86400" in command
+
+
 def test_roemia_launcher_uses_configured_gpu_server_data_base(
     tmp_path: Path,
 ) -> None:
