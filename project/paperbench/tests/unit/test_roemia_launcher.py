@@ -483,6 +483,61 @@ esac
     )
 
 
+def test_roemia_launcher_prefers_matching_gpu_before_larger_fallback(
+    tmp_path: Path,
+) -> None:
+    launcher = get_root() / "scripts" / "run-paperbench-roemia.sh"
+    auth_file = tmp_path / "auth.json"
+    agent_env = tmp_path / "agent.env"
+    data_root = tmp_path / "data"
+    bin_dir = tmp_path / "bin"
+    auth_file.write_text("{}\n")
+    agent_env.write_text("OPENAI_API_KEY=test-placeholder\n")
+    bin_dir.mkdir()
+
+    nvidia_smi = bin_dir / "nvidia-smi"
+    nvidia_smi.write_text(
+        """#!/usr/bin/env bash
+case "$*" in
+  *--query-compute-apps=gpu_uuid*)
+    ;;
+  *--query-gpu=index,uuid,name,memory.total,memory.free*)
+    printf '%s\\n' \\
+      '0, GPU-a100-80gb, NVIDIA A100 80GB PCIe, 81920, 81000' \\
+      '1, GPU-a100-40gb, NVIDIA A100-PCIE-40GB, 40960, 40000'
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+"""
+    )
+    nvidia_smi.chmod(0o755)
+
+    result = subprocess.run(
+        [str(launcher), "--dry-run", "--paper", "bam"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "PAPERBENCH_DATA_ROOT": str(data_root),
+            "CODEX_AUTH_FILE": str(auth_file),
+            "PAPERBENCH_AGENT_ENV": str(agent_env),
+            "PAPERBENCH_AGENT_GPU_NAME_PATTERN": "A100",
+            "PAPERBENCH_AGENT_MIN_GPU_MEMORY_MIB": "40000",
+            "PAPERBENCH_AGENT_PREFERRED_GPU_NAME_PATTERN": "40GB",
+        },
+    )
+
+    assert "Selected GPU 1 (GPU-a100-40gb" in result.stderr
+    assert (
+        result.stdout.count("computer_runtime.env.gpu_device_id=GPU-a100-40gb")
+        == 2
+    )
+
+
 def test_roemia_launcher_reselects_a_qualified_gpu_while_waiting(
     tmp_path: Path,
 ) -> None:

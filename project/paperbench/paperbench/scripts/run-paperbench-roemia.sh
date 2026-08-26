@@ -25,6 +25,9 @@ Environment overrides:
   PAPERBENCH_GPU_DEVICE  GPU index or UUID (default: select one idle GPU)
   PAPERBENCH_AGENT_GPU_NAME_PATTERN
                          Restrict automatic selection to matching GPU names
+  PAPERBENCH_AGENT_PREFERRED_GPU_NAME_PATTERN
+                         Prefer matching GPU names, then fall back to other
+                         eligible GPUs
   PAPERBENCH_AGENT_MIN_GPU_MEMORY_MIB
                          Minimum total GPU memory for automatic selection
                          (default: 0)
@@ -43,6 +46,7 @@ launch_mode=""
 requirements_csv=""
 requested_gpu="${PAPERBENCH_GPU_DEVICE:-}"
 gpu_name_pattern="${PAPERBENCH_AGENT_GPU_NAME_PATTERN:-}"
+preferred_gpu_name_pattern="${PAPERBENCH_AGENT_PREFERRED_GPU_NAME_PATTERN:-}"
 minimum_gpu_memory_mib="${PAPERBENCH_AGENT_MIN_GPU_MEMORY_MIB:-0}"
 gpu_wait_timeout="${PAPERBENCH_AGENT_GPU_WAIT_TIMEOUT_SECONDS:-21600}"
 gpu_poll_interval="${PAPERBENCH_AGENT_GPU_POLL_INTERVAL_SECONDS:-60}"
@@ -242,6 +246,7 @@ select_gpu() {
   local name
   local total_memory
   local free_memory
+  local preference_rank
   local requested_gpu_found=false
 
   gpu_device_id=""
@@ -259,7 +264,8 @@ select_gpu() {
       --format=csv,noheader 2>/dev/null || true
   )"
 
-  while IFS=',' read -r free_memory index uuid; do
+  while IFS=',' read -r preference_rank free_memory index uuid; do
+    preference_rank="$(trim_whitespace "$preference_rank")"
     free_memory="$(trim_whitespace "$free_memory")"
     index="$(trim_whitespace "$index")"
     uuid="$(trim_whitespace "$uuid")"
@@ -298,8 +304,14 @@ select_gpu() {
       if ((total_memory < minimum_gpu_memory_mib)); then
         continue
       fi
-      printf '%s,%s,%s\n' "$free_memory" "$index" "$uuid"
-    done <<<"$inventory" | sort -t, -k1,1nr
+      preference_rank=1
+      if [[ -z "$preferred_gpu_name_pattern" || \
+        "$name" == *"$preferred_gpu_name_pattern"* ]]; then
+        preference_rank=0
+      fi
+      printf '%s,%s,%s,%s\n' \
+        "$preference_rank" "$free_memory" "$index" "$uuid"
+    done <<<"$inventory" | sort -t, -k1,1n -k2,2nr
   )
 
   if [[ -z "$gpu_device_id" ]]; then
