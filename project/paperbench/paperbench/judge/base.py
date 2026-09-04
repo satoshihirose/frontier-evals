@@ -202,6 +202,19 @@ class Judge(ABC):
                 graded = await grade_leaf_fn(task)
             except openai.RateLimitError:
                 raise
+            except openai.APITimeoutError as error:
+                logger.warning(
+                    "Leaf grading timed out; recording an invalid result without retrying",
+                    task_id=task.id,
+                    error=str(error),
+                )
+                return GradedTaskNode.from_task(
+                    task,
+                    score=0.0,
+                    valid_score=False,
+                    explanation=str(error),
+                    judge_metadata=None,
+                )
             except Exception as error:
                 if retry_number >= self.max_invalid_leaf_retries:
                     raise

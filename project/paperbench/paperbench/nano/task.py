@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -30,6 +31,10 @@ from paperbench.constants import (
     AGENT_DIR_CONFIG,
     SUBMISSION_DIR,
     WORKSPACE_BASE,
+)
+from paperbench.evaluation_specification import (
+    JUDGE_ADDENDUM_CONTAINER_PATH,
+    RUBRIC_CONTAINER_PATH,
 )
 from paperbench.grade import JudgeOutput, grade_submission
 from paperbench.monitor.monitor import Monitor, MonitorResult
@@ -73,6 +78,10 @@ class PBTask(ComputerTask):
     requirements_csv: str | None = None
     requirements_csv_sha256: str | None = None
     requirements_count: int = 0
+    requirements_mode: str = "none"
+    source_requirements_sha256: str | None = None
+    source_requirement_count: int = 0
+    excluded_requirement_ids: list[str] = Field(default_factory=list)
 
     save_cluster_output_to_host: bool
 
@@ -102,6 +111,25 @@ class PBTask(ComputerTask):
         await computer.check_shell_command(f"mkdir -p {REQUIREMENTS_CONTAINER_DIR}")
         await computer.upload(requirements.content, REQUIREMENTS_CONTAINER_PATH)
         await computer.check_shell_command(f"chmod 0444 {REQUIREMENTS_CONTAINER_PATH}")
+
+    async def _setup_evaluation_specification(self, computer: ComputerInterface) -> None:
+        if self.requirements_mode != "rubric-visible":
+            return
+
+        paper = paper_registry.get_paper(self.paper_id)
+        if not paper.rubric.is_file():
+            raise FileNotFoundError(
+                f"Rubric-visible mode requires a rubric.json: {paper.rubric}"
+            )
+        await computer.upload(paper.rubric.read_bytes(), RUBRIC_CONTAINER_PATH)
+        await computer.check_shell_command(f"chmod 0444 {RUBRIC_CONTAINER_PATH}")
+        if paper.judge_addendum.is_file():
+            await computer.upload(
+                paper.judge_addendum.read_bytes(), JUDGE_ADDENDUM_CONTAINER_PATH
+            )
+            await computer.check_shell_command(
+                f"chmod 0444 {JUDGE_ADDENDUM_CONTAINER_PATH}"
+            )
 
     @override
     async def _setup(self, computer: ComputerInterface, runtime_config: RuntimeConfig) -> None:
@@ -158,6 +186,7 @@ class PBTask(ComputerTask):
                 await computer.upload(f.read(), f"{WORKSPACE_BASE}/paper/assets/{asset.name}")
 
         await self._setup_requirements(computer)
+        await self._setup_evaluation_specification(computer)
 
         for dir in [SUBMISSION_DIR]:
             await computer.check_shell_command(f"mkdir -p {dir}")
@@ -165,10 +194,35 @@ class PBTask(ComputerTask):
     def requirements_input_metadata(self) -> dict[str, object]:
         provided = self.requirements_csv is not None
         return {
+            "requirements_mode": self.requirements_mode,
             "provided": provided,
-            "sha256": self.requirements_csv_sha256 if provided else None,
-            "requirement_count": self.requirements_count if provided else 0,
+            "provided_requirements_sha256": (self.requirements_csv_sha256 if provided else None),
+            "provided_requirement_count": self.requirements_count if provided else 0,
+            "source_requirements_sha256": self.source_requirements_sha256,
+            "source_requirement_count": self.source_requirement_count,
+            "excluded_requirement_ids": self.excluded_requirement_ids,
             "container_path": REQUIREMENTS_CONTAINER_PATH if provided else None,
+        }
+
+    def evaluation_specification_metadata(self) -> dict[str, object]:
+        visible = self.requirements_mode == "rubric-visible"
+        paper = paper_registry.get_paper(self.paper_id)
+
+        def digest(path: Path) -> str | None:
+            if not visible or not path.is_file():
+                return None
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+
+        rubric_sha256 = digest(paper.rubric)
+        judge_addendum_sha256 = digest(paper.judge_addendum)
+        return {
+            "visible": visible,
+            "rubric_container_path": RUBRIC_CONTAINER_PATH if rubric_sha256 else None,
+            "rubric_sha256": rubric_sha256,
+            "judge_addendum_container_path": (
+                JUDGE_ADDENDUM_CONTAINER_PATH if judge_addendum_sha256 else None
+            ),
+            "judge_addendum_sha256": judge_addendum_sha256,
         }
 
     async def _ensure_files_available_for_grading(self, computer: ComputerInterface) -> None:

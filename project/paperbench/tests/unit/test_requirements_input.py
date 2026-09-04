@@ -9,6 +9,7 @@ from paperbench.requirements import (
     REQUIREMENTS_CONTAINER_PATH,
     REQUIREMENTS_INSTRUCTION,
     add_requirements_instruction,
+    add_self_generated_requirements_instruction,
     load_requirements_input,
 )
 
@@ -58,3 +59,32 @@ def test_add_requirements_instruction_appends_fixed_agent_resource_notice() -> N
     assert result.startswith(base)
     assert REQUIREMENTS_INSTRUCTION in result
     assert REQUIREMENTS_CONTAINER_PATH in result
+    assert "extracted and normalized from the" in result
+    assert "Each `requirement_statement` describes a condition" in result
+    assert "must satisfy" in result
+    assert "operational summary" in result
+    assert "additional list" not in result.lower()
+
+
+def test_self_generated_requirements_instruction_includes_task_constraints() -> None:
+    result = add_self_generated_requirements_instruction(
+        "Reproduce the paper.\n",
+        self_generated=True,
+    )
+    normalized_result = " ".join(result.split())
+
+    assert (
+        "all reproduction-defining constraints stated in the task instructions above"
+        in normalized_result
+    )
+    assert "concrete benchmark task contracts" in normalized_result
+    assert "explicitly delegates that missing choice" in normalized_result
+    assert "mere citation or attribution" in normalized_result
+    assert "pure scope exclusions as filters" in normalized_result
+    assert "appendix-only experiments" in normalized_result
+    assert (
+        "implementation details for an in-scope main-body experiment"
+        in normalized_result
+    )
+    assert "explicitly corrects or replaces" in normalized_result
+    assert "later source position alone" in normalized_result

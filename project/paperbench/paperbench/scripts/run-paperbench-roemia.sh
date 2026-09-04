@@ -31,10 +31,19 @@ Environment overrides:
   PAPERBENCH_AGENT_MIN_GPU_MEMORY_MIB
                          Minimum total GPU memory for automatic selection
                          (default: 0)
+  PAPERBENCH_WORKLOAD_EXCLUDED_GPU_INDICES
+                         Comma-separated GPU indices unavailable to the Agent
+                         and Reproduction workloads
   PAPERBENCH_AGENT_GPU_WAIT_TIMEOUT_SECONDS
                          GPU wait timeout (default: 21600 / 6 hours)
   PAPERBENCH_AGENT_GPU_POLL_INTERVAL_SECONDS
                          GPU recheck interval (default: 60 / 1 minute)
+  REPROGAP_GPU_ACQUIRE_MODE
+                         wait (default) or fail-fast for queue dispatch
+  PAPERBENCH_NVIDIA_USE_VISIBLE_DEVICES
+                         auto (default), 1, or 0. Auto uses the legacy
+                         NVIDIA_VISIBLE_DEVICES path when the host persistence
+                         socket required by its CDI spec is absent.
   CODEX_AUTH_FILE       Host Codex auth source copied into an isolated per-run
                         directory (default: $HOME/.codex/auth.json)
   PAPERBENCH_AGENT_ENV  PaperBench agent.env used by the checkout
@@ -48,8 +57,11 @@ requested_gpu="${PAPERBENCH_GPU_DEVICE:-}"
 gpu_name_pattern="${PAPERBENCH_AGENT_GPU_NAME_PATTERN:-}"
 preferred_gpu_name_pattern="${PAPERBENCH_AGENT_PREFERRED_GPU_NAME_PATTERN:-}"
 minimum_gpu_memory_mib="${PAPERBENCH_AGENT_MIN_GPU_MEMORY_MIB:-0}"
+excluded_gpu_indices="${PAPERBENCH_WORKLOAD_EXCLUDED_GPU_INDICES:-}"
 gpu_wait_timeout="${PAPERBENCH_AGENT_GPU_WAIT_TIMEOUT_SECONDS:-21600}"
 gpu_poll_interval="${PAPERBENCH_AGENT_GPU_POLL_INTERVAL_SECONDS:-60}"
+gpu_acquire_mode="${REPROGAP_GPU_ACQUIRE_MODE:-wait}"
+nvidia_visible_devices_mode="${PAPERBENCH_NVIDIA_USE_VISIBLE_DEVICES:-auto}"
 paper=""
 extra_args=()
 while (($#)); do
@@ -138,9 +150,30 @@ if [[ ! "$gpu_poll_interval" =~ ^[1-9][0-9]*$ ]]; then
     "$gpu_poll_interval" >&2
   exit 2
 fi
+case "$gpu_acquire_mode" in
+  wait|fail-fast) ;;
+  *)
+    printf 'Invalid REPROGAP_GPU_ACQUIRE_MODE: %s\n' "$gpu_acquire_mode" >&2
+    exit 2
+    ;;
+esac
+case "$nvidia_visible_devices_mode" in
+  auto|0|1|false|true) ;;
+  *)
+    printf 'Invalid PAPERBENCH_NVIDIA_USE_VISIBLE_DEVICES: %s\n' \
+      "$nvidia_visible_devices_mode" >&2
+    exit 2
+    ;;
+esac
 if [[ ! "$minimum_gpu_memory_mib" =~ ^[0-9]+$ ]]; then
   printf 'Invalid PAPERBENCH_AGENT_MIN_GPU_MEMORY_MIB: %s\n' \
     "$minimum_gpu_memory_mib" >&2
+  exit 2
+fi
+if [[ -n "$excluded_gpu_indices" && \
+  ! "$excluded_gpu_indices" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+  printf 'Invalid PAPERBENCH_WORKLOAD_EXCLUDED_GPU_INDICES: %s\n' \
+    "$excluded_gpu_indices" >&2
   exit 2
 fi
 
@@ -237,6 +270,11 @@ gpu_index=""
 gpu_free_memory=""
 gpu_lock_fd=""
 
+gpu_index_is_excluded() {
+  local candidate_index="$1"
+  [[ -n "$excluded_gpu_indices" && ",${excluded_gpu_indices}," == *",${candidate_index},"* ]]
+}
+
 select_gpu() {
   local acquire_lock="$1"
   local inventory
@@ -298,6 +336,9 @@ select_gpu() {
       name="$(trim_whitespace "$name")"
       total_memory="$(trim_whitespace "$total_memory")"
       free_memory="$(trim_whitespace "$free_memory")"
+      if gpu_index_is_excluded "$index"; then
+        continue
+      fi
       if [[ -n "$gpu_name_pattern" && "$name" != *"$gpu_name_pattern"* ]]; then
         continue
       fi
@@ -354,6 +395,10 @@ wait_for_gpu() {
     if ((selection_status == 2)); then
       printf 'Requested GPU was not found: %s\n' "$requested_gpu" >&2
       return 1
+    fi
+    if [[ "$gpu_acquire_mode" == fail-fast ]]; then
+      printf '%s\n' 'No eligible GPU is immediately available.' >&2
+      return 75
     fi
 
     wait_elapsed="$((SECONDS - wait_started))"
@@ -428,6 +473,22 @@ else
   wait_for_gpu
 fi
 
+use_nvidia_visible_devices=false
+case "$nvidia_visible_devices_mode" in
+  1|true)
+    use_nvidia_visible_devices=true
+    ;;
+  auto)
+    if ! $dry_run && [[ ! -S /run/nvidia-persistenced/socket ]]; then
+      # A stale system CDI spec may still require this deleted socket. The
+      # legacy runtime selects the same locked GPU without that host mount.
+      use_nvidia_visible_devices=true
+      printf '%s\n' \
+        'NVIDIA persistence socket is absent; using NVIDIA_VISIBLE_DEVICES runtime fallback.' >&2
+    fi
+    ;;
+esac
+
 command=(
   uv run python -m paperbench.nano.entrypoint
   paperbench.paper_id="$paper_id"
@@ -439,6 +500,7 @@ command=(
   paperbench.solver.computer_runtime.env.pull_from_registry=false
   paperbench.solver.computer_runtime.env.is_nvidia_gpu_env=true
   paperbench.solver.computer_runtime.env.gpu_device_id="$gpu_device_id"
+  paperbench.solver.computer_runtime.env.use_nvidia_visible_devices="$use_nvidia_visible_devices"
   paperbench.solver.computer_runtime.env.volumes_config.paperbench_cache.bind_source="$cache_dir"
   paperbench.solver.computer_runtime.env.volumes_config.paperbench_cache.bind_dest=/root/.cache
   paperbench.solver.computer_runtime.env.volumes_config.paperbench_cache.mode=rw
@@ -450,6 +512,7 @@ command=(
   paperbench.reproduction.computer_runtime.env.pull_from_registry=false
   paperbench.reproduction.computer_runtime.env.is_nvidia_gpu_env=true
   paperbench.reproduction.computer_runtime.env.gpu_device_id="$gpu_device_id"
+  paperbench.reproduction.computer_runtime.env.use_nvidia_visible_devices="$use_nvidia_visible_devices"
   paperbench.reproduction.computer_runtime.env.volumes_config.paperbench_cache.bind_source="$cache_dir"
   paperbench.reproduction.computer_runtime.env.volumes_config.paperbench_cache.bind_dest=/root/.cache
   paperbench.reproduction.computer_runtime.env.volumes_config.paperbench_cache.mode=rw

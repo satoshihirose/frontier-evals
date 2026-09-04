@@ -465,6 +465,11 @@ attempt. This fallback follows PaperBench's existing assumption that a longer ru
 to be an early exit, while preventing a short failure in the final configuration from
 arbitrarily replacing a more substantive earlier attempt.
 
+A timed-out reproduction is terminal and is never retried with another Python/virtualenv
+configuration. A timeout has already consumed the configured reproduction budget (24 hours in
+the full launcher), so retrying it could multiply one run into four full-duration attempts
+without evidence that an interpreter change would help.
+
 When salvage is enabled, each attempt is retained as
 `submission_executed_attempt_N.tar.gz` with matching metadata. The selected archive is copied to
 the canonical `submission_executed.tar.gz` path consumed by the Judge. Consequently, future
@@ -478,6 +483,12 @@ waits five seconds, and then sends `SIGKILL` if anything remains. The timed-out 
 once by default. These are per-call settings: one leaf can include file selection, grading, and
 structured score-parsing calls, and only the call that timed out is repeated. Set
 `timeout_retries=0` to disable that retry.
+
+For the local vLLM completer, an `APITimeoutError` is recorded immediately as
+an invalid leaf instead of entering the Judge's general invalid-leaf retry
+loop. Configure `completer_config.max_retries=0` when one HTTP attempt per leaf
+is required. Other transient exceptions and invalid model responses retain the
+general leaf retry behavior.
 
 Every successfully graded leaf is appended immediately to
 `*_leaf_checkpoints.jsonl` beside the grader output. If grading is interrupted before

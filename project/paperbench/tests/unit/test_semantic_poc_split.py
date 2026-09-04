@@ -4,6 +4,10 @@ from typing import cast
 import pytest
 
 from nanoeval.solvers.computer_tasks.code_execution_interface import ComputerInterface, NetworkMode
+from paperbench.evaluation_specification import (
+    JUDGE_ADDENDUM_CONTAINER_PATH,
+    RUBRIC_CONTAINER_PATH,
+)
 from paperbench.nano.eval import PaperBench
 from paperbench.requirements import REQUIREMENTS_CONTAINER_PATH
 from paperbench.solvers.codex.solver import CodexSolver
@@ -88,6 +92,93 @@ async def test_direct_paper_id_creates_one_task_without_a_split(
 
 
 @pytest.mark.asyncio
+async def test_rubric_visible_mode_adds_prompt_and_evaluation_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr("paperbench.nano.eval.GRADER_OPENAI_API_KEY", "test-key")
+    paperbench = PaperBench(
+        paper_id="semantic-self-consistency",
+        solver=CodexSolver(),
+        runs_dir=str(tmp_path),
+        requirements_mode="rubric-visible",
+    )
+
+    tasks = await paperbench.get_instances()
+
+    assert len(tasks) == 1
+    assert tasks[0].requirements_mode == "rubric-visible"
+    assert tasks[0].requirements_csv is None
+    prompt_content = tasks[0].prompt[0]["content"]
+    assert isinstance(prompt_content, str)
+    assert "## Additional evaluation specification" in prompt_content
+    assert "`rubric.json`" in prompt_content
+    assert "`judge.addendum.md` when that file is present" in prompt_content
+
+    computer = RecordingComputer()
+    await tasks[0]._setup_evaluation_specification(cast(ComputerInterface, computer))
+
+    assert RUBRIC_CONTAINER_PATH in computer.uploads
+    assert JUDGE_ADDENDUM_CONTAINER_PATH in computer.uploads
+    metadata = tasks[0].evaluation_specification_metadata()
+    assert metadata["visible"] is True
+    assert metadata["rubric_sha256"]
+    assert metadata["judge_addendum_sha256"]
+
+
+@pytest.mark.asyncio
+async def test_non_rubric_mode_does_not_expose_evaluation_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr("paperbench.nano.eval.GRADER_OPENAI_API_KEY", "test-key")
+    paperbench = PaperBench(
+        paper_id="semantic-self-consistency",
+        solver=CodexSolver(),
+        runs_dir=str(tmp_path),
+        requirements_mode="none",
+    )
+
+    tasks = await paperbench.get_instances()
+    prompt_content = tasks[0].prompt[0]["content"]
+    assert isinstance(prompt_content, str)
+    assert "## Additional evaluation specification" not in prompt_content
+
+    computer = RecordingComputer()
+    await tasks[0]._setup_evaluation_specification(cast(ComputerInterface, computer))
+
+    assert computer.uploads == {}
+    assert tasks[0].evaluation_specification_metadata() == {
+        "visible": False,
+        "rubric_container_path": None,
+        "rubric_sha256": None,
+        "judge_addendum_container_path": None,
+        "judge_addendum_sha256": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_rubric_visible_mode_allows_missing_judge_addendum(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr("paperbench.nano.eval.GRADER_OPENAI_API_KEY", "test-key")
+    tasks = await PaperBench(
+        paper_id="adaptive-pruning",
+        solver=CodexSolver(),
+        runs_dir=str(tmp_path),
+        requirements_mode="rubric-visible",
+    ).get_instances()
+
+    computer = RecordingComputer()
+    await tasks[0]._setup_evaluation_specification(cast(ComputerInterface, computer))
+
+    assert RUBRIC_CONTAINER_PATH in computer.uploads
+    assert JUDGE_ADDENDUM_CONTAINER_PATH not in computer.uploads
+    metadata = tasks[0].evaluation_specification_metadata()
+    assert metadata["rubric_sha256"]
+    assert metadata["judge_addendum_container_path"] is None
+    assert metadata["judge_addendum_sha256"] is None
+
+
+@pytest.mark.asyncio
 async def test_direct_paper_id_adds_requirements_to_task_condition(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -124,8 +215,12 @@ async def test_direct_paper_id_adds_requirements_to_task_condition(
     assert any(command.startswith("mkdir -p ") for command in computer.commands)
     assert f"chmod 0444 {REQUIREMENTS_CONTAINER_PATH}" in computer.commands
     assert tasks[0].requirements_input_metadata() == {
+        "requirements_mode": "full",
         "provided": True,
-        "sha256": tasks[0].requirements_csv_sha256,
-        "requirement_count": 1,
+        "provided_requirements_sha256": tasks[0].requirements_csv_sha256,
+        "provided_requirement_count": 1,
+        "source_requirements_sha256": tasks[0].requirements_csv_sha256,
+        "source_requirement_count": 1,
+        "excluded_requirement_ids": [],
         "container_path": REQUIREMENTS_CONTAINER_PATH,
     }

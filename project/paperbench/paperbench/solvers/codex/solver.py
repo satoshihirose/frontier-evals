@@ -25,14 +25,12 @@ from paperbench.constants import AGENT_DIR_CONFIG, LOGS_DIR, WORKSPACE_BASE
 from paperbench.nano.structs import AgentOutput
 from paperbench.nano.task import PBTask
 from paperbench.solvers.base import BasePBSolver
-from paperbench.solvers.basicagent.prompts.templates import (
-    additional_notes_template,
-    get_system_message,
-    gpu_template,
-    no_gpu_template,
-    time_limit_template,
+from paperbench.solvers.basicagent.prompts.templates import get_system_message
+from paperbench.solvers.basicagent.utils import (
+    build_user_instructions,
+    get_gpu_generation,
+    get_task_instruction_text,
 )
-from paperbench.solvers.basicagent.utils import get_gpu_generation
 from paperbench.solvers.upload import upload_heavy_logs, upload_status
 from paperbench.solvers.utils import check_for_existing_run, sanity_check_docker
 
@@ -65,16 +63,11 @@ def build_codex_user_instructions(
     """Add the user-level runtime context that BasicAgent receives."""
     if time_limit <= 0:
         raise ValueError("time_limit must be positive")
-    type_of_processor_str = (
-        gpu_template.format(type_of_processor=gpu_generation) if gpu_generation else no_gpu_template
+    return build_user_instructions(
+        base_instructions=base_instructions,
+        time_limit=time_limit,
+        gpu_generation=gpu_generation,
     )
-    time_limit_str = time_limit_template.format(max_time_in_hours=round(time_limit / 3600, 3))
-    runtime_context = additional_notes_template.format(
-        type_of_processor_str=type_of_processor_str,
-        time_limit_str=time_limit_str,
-        workspace_base=WORKSPACE_BASE,
-    )
-    return f"{base_instructions.rstrip()}\n{runtime_context}"
 
 
 def _redact_url(url: str) -> str:
@@ -414,11 +407,7 @@ class CodexSolver(BasePBSolver):
             status="running",
         )
 
-        base_instructions = task.prompt[0].get("content")
-        if not isinstance(base_instructions, str):
-            raise TypeError(
-                f"Expected task instructions to be str, got {type(base_instructions)!r}"
-            )
+        base_instructions = get_task_instruction_text(task)
         gpu_generation = await get_gpu_generation(computer)
         effective_instructions = build_codex_user_instructions(
             base_instructions=base_instructions,

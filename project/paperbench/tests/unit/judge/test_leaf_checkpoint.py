@@ -4,6 +4,8 @@ import tarfile
 from pathlib import Path
 from typing import Any
 
+import httpx
+import openai
 import pytest
 
 from paperbench import grade as grade_module
@@ -167,6 +169,31 @@ async def test_judge_returns_invalid_after_three_leaf_retries(tmp_path: Path) ->
     assert judge.calls.count("leaf-a") == 1
     assert judge.calls.count("leaf-b") == 4
     assert result.find("leaf-b").valid_score is False
+
+
+@pytest.mark.asyncio
+async def test_judge_records_timeout_as_invalid_without_repeating_leaf(
+    tmp_path: Path,
+) -> None:
+    judge = _judge(tmp_path, _rubric(), context_hash="timeout-leaf")
+
+    async def grade_leaf(task: TaskNode) -> GradedTaskNode:
+        judge.calls.append(task.id)
+        if task.id == "leaf-b":
+            raise openai.APITimeoutError(request=httpx.Request("POST", "http://judge"))
+        return GradedTaskNode.from_task(
+            task,
+            score=1.0,
+            valid_score=True,
+            explanation="graded",
+        )
+
+    result = await judge.judge(grade_leaf_fn=grade_leaf)
+
+    assert judge.calls.count("leaf-a") == 1
+    assert judge.calls.count("leaf-b") == 1
+    assert result.find("leaf-b").valid_score is False
+    assert result.score == 0.5
 
 
 @pytest.mark.asyncio

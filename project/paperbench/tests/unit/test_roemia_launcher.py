@@ -298,6 +298,39 @@ def test_roemia_launcher_externalizes_runs_cache_and_tmp(tmp_path: Path) -> None
     assert "test-placeholder" not in command
 
 
+def test_roemia_launcher_can_select_legacy_nvidia_visible_devices(
+    tmp_path: Path,
+) -> None:
+    launcher = get_root() / "scripts" / "run-paperbench-roemia.sh"
+    auth_file = tmp_path / "auth.json"
+    agent_env = tmp_path / "agent.env"
+    auth_file.write_text("{}\n")
+    agent_env.write_text("OPENAI_API_KEY=test-placeholder\n")
+
+    result = subprocess.run(
+        [str(launcher), "--dry-run", "--paper", "bam"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PAPERBENCH_DATA_ROOT": str(tmp_path / "data"),
+            "CODEX_AUTH_FILE": str(auth_file),
+            "PAPERBENCH_AGENT_ENV": str(agent_env),
+            "PAPERBENCH_NVIDIA_USE_VISIBLE_DEVICES": "1",
+        },
+    )
+
+    assert (
+        "paperbench.solver.computer_runtime.env.use_nvidia_visible_devices=true"
+        in result.stdout
+    )
+    assert (
+        "paperbench.reproduction.computer_runtime.env.use_nvidia_visible_devices=true"
+        in result.stdout
+    )
+
+
 def test_roemia_launcher_omits_codex_only_options_for_custom_solver(
     tmp_path: Path,
 ) -> None:
@@ -538,6 +571,175 @@ esac
     )
 
 
+def test_roemia_launcher_excludes_reserved_workload_gpu_indices(
+    tmp_path: Path,
+) -> None:
+    launcher = get_root() / "scripts" / "run-paperbench-roemia.sh"
+    auth_file = tmp_path / "auth.json"
+    agent_env = tmp_path / "agent.env"
+    data_root = tmp_path / "data"
+    bin_dir = tmp_path / "bin"
+    auth_file.write_text("{}\n")
+    agent_env.write_text("OPENAI_API_KEY=test-placeholder\n")
+    bin_dir.mkdir()
+
+    nvidia_smi = bin_dir / "nvidia-smi"
+    nvidia_smi.write_text(
+        """#!/usr/bin/env bash
+case "$*" in
+  *--query-compute-apps=gpu_uuid*)
+    ;;
+  *--query-gpu=index,uuid,name,memory.total,memory.free*)
+    printf '%s\\n' \\
+      '0, GPU-allowed, NVIDIA A100 80GB PCIe, 81920, 70000' \\
+      '1, GPU-reserved-one, NVIDIA A100 80GB PCIe, 81920, 81000' \\
+      '2, GPU-reserved-two, NVIDIA A100 80GB PCIe, 81920, 80000'
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+"""
+    )
+    nvidia_smi.chmod(0o755)
+
+    result = subprocess.run(
+        [str(launcher), "--dry-run", "--paper", "bam"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "PAPERBENCH_DATA_ROOT": str(data_root),
+            "CODEX_AUTH_FILE": str(auth_file),
+            "PAPERBENCH_AGENT_ENV": str(agent_env),
+            "PAPERBENCH_WORKLOAD_EXCLUDED_GPU_INDICES": "1,2",
+        },
+    )
+
+    assert "Selected GPU 0 (GPU-allowed" in result.stderr
+    assert (
+        result.stdout.count("computer_runtime.env.gpu_device_id=GPU-allowed")
+        == 2
+    )
+    assert "GPU-reserved-one" not in result.stdout
+    assert "GPU-reserved-two" not in result.stdout
+
+
+def test_roemia_launcher_rejects_explicit_reserved_workload_gpu(
+    tmp_path: Path,
+) -> None:
+    launcher = get_root() / "scripts" / "run-paperbench-roemia.sh"
+    auth_file = tmp_path / "auth.json"
+    agent_env = tmp_path / "agent.env"
+    data_root = tmp_path / "data"
+    bin_dir = tmp_path / "bin"
+    auth_file.write_text("{}\n")
+    agent_env.write_text("OPENAI_API_KEY=test-placeholder\n")
+    bin_dir.mkdir()
+
+    nvidia_smi = bin_dir / "nvidia-smi"
+    nvidia_smi.write_text(
+        """#!/usr/bin/env bash
+case "$*" in
+  *--query-compute-apps=gpu_uuid*)
+    ;;
+  *--query-gpu=index,uuid,name,memory.total,memory.free*)
+    printf '%s\\n' \\
+      '1, GPU-reserved-one, NVIDIA A100 80GB PCIe, 81920, 81000'
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+"""
+    )
+    nvidia_smi.chmod(0o755)
+
+    result = subprocess.run(
+        [str(launcher), "--dry-run", "--paper", "bam", "--gpu", "1"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "PAPERBENCH_DATA_ROOT": str(data_root),
+            "CODEX_AUTH_FILE": str(auth_file),
+            "PAPERBENCH_AGENT_ENV": str(agent_env),
+            "PAPERBENCH_WORKLOAD_EXCLUDED_GPU_INDICES": "1,2",
+        },
+    )
+
+    assert result.returncode == 1
+    assert "Requested GPU was not found or is unavailable: 1" in result.stderr
+
+
+def test_roemia_launcher_fail_fast_returns_resource_unavailable(
+    tmp_path: Path,
+) -> None:
+    source_launcher = get_root() / "scripts" / "run-paperbench-roemia.sh"
+    paperbench_root = tmp_path / "paperbench"
+    scripts_dir = paperbench_root / "paperbench" / "scripts"
+    experiments_dir = paperbench_root / "experiments"
+    scripts_dir.mkdir(parents=True)
+    experiments_dir.mkdir(parents=True)
+    launcher = scripts_dir / source_launcher.name
+    shutil.copy2(source_launcher, launcher)
+    materializer = scripts_dir / "materialize-paper-assets.sh"
+    materializer.write_text("#!/usr/bin/env bash\nexit 0\n")
+    materializer.chmod(0o755)
+    (experiments_dir / "paper-aliases.tsv").write_text("new-paper\tnew-paper\n")
+    auth_file = tmp_path / "auth.json"
+    agent_env = tmp_path / "agent.env"
+    data_root = tmp_path / "data"
+    bin_dir = tmp_path / "bin"
+    auth_file.write_text("{}\n")
+    agent_env.write_text("OPENAI_API_KEY=test-placeholder\n")
+    bin_dir.mkdir()
+    fake_flock = bin_dir / "flock"
+    fake_flock.write_text("#!/usr/bin/env bash\nexit 0\n")
+    fake_flock.chmod(0o755)
+
+    nvidia_smi = bin_dir / "nvidia-smi"
+    nvidia_smi.write_text(
+        """#!/usr/bin/env bash
+case "$*" in
+  *--query-compute-apps=gpu_uuid*)
+    printf '%s\\n' GPU-busy
+    ;;
+  *--query-gpu=index,uuid,name,memory.total,memory.free*)
+    printf '%s\\n' '0, GPU-busy, NVIDIA A100 40GB, 40960, 39000'
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+"""
+    )
+    nvidia_smi.chmod(0o755)
+
+    result = subprocess.run(
+        [str(launcher), "--paper", "new-paper", "--standalone"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "PAPERBENCH_DATA_BASE": str(tmp_path),
+            "PAPERBENCH_DATA_ROOT": str(data_root),
+            "CODEX_AUTH_FILE": str(auth_file),
+            "PAPERBENCH_AGENT_ENV": str(agent_env),
+            "REPROGAP_GPU_ACQUIRE_MODE": "fail-fast",
+        },
+    )
+
+    assert result.returncode == 75
+    assert "No eligible GPU is immediately available" in result.stderr
+
+
 def test_roemia_launcher_reselects_a_qualified_gpu_while_waiting(
     tmp_path: Path,
 ) -> None:
@@ -705,3 +907,17 @@ def test_alcatraz_limits_nvidia_container_to_configured_gpu() -> None:
     assert len(requests) == 1
     assert requests[0]["DeviceIDs"] == [gpu_uuid]
     assert requests[0]["Count"] == 0
+
+
+def test_alcatraz_legacy_nvidia_mode_uses_visible_devices_without_cdi_request() -> None:
+    from alcatraz.clusters.local import LocalConfig
+
+    gpu_uuid = "GPU-12345678"
+    cluster = LocalConfig(
+        is_nvidia_gpu_env=True,
+        gpu_device_id=gpu_uuid,
+        use_nvidia_visible_devices=True,
+    ).build()
+
+    assert cluster._gpu_device_requests() == []
+    assert cluster._main_container_environment()["NVIDIA_VISIBLE_DEVICES"] == gpu_uuid

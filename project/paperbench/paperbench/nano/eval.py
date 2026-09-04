@@ -1,3 +1,4 @@
+import json
 import os
 import re
 from typing import Any, Sequence
@@ -24,6 +25,7 @@ from nanoeval.solvers.computer_tasks.code_execution_interface import (
 from nanoeval.solvers.computer_tasks.solver import PythonCodingEval
 from nanoeval.solvers.computer_tasks.steps import FinalResult
 from nanoeval.solvers.computer_tasks.task import ComputerTask
+from paperbench.evaluation_specification import add_evaluation_specification_instruction
 from paperbench.metrics import compute_agg_stats, per_paper_results
 from paperbench.monitor.monitor import BasicMonitor, Monitor
 from paperbench.nano.structs import (
@@ -33,7 +35,11 @@ from paperbench.nano.structs import (
 )
 from paperbench.nano.task import PBTask
 from paperbench.nano.utils import gather_eval_runs, load_paper_split
-from paperbench.requirements import add_requirements_instruction, load_requirements_input
+from paperbench.requirements import (
+    add_requirements_instruction,
+    add_self_generated_requirements_instruction,
+    load_requirements_input,
+)
 from paperbench.utils import (
     create_run_dir,
     create_run_id,
@@ -97,6 +103,17 @@ class PaperBench(PythonCodingEval):
             "Leave unset for the PaperBench baseline condition."
         ),
     )
+    requirements_mode: str = chz.field(
+        default="auto",
+        doc=(
+            "Requirements condition: none, self-generated, full, no-clarification, "
+            "or rubric-visible. Auto keeps "
+            "backward compatibility by inferring full when requirements_csv is set."
+        ),
+    )
+    requirements_source_sha256: str | None = chz.field(default=None)
+    requirements_source_count: int | None = chz.field(default=None)
+    requirements_excluded_ids_json: str = chz.field(default="[]")
 
     # other args
     runs_dir: str = chz.field(default=get_default_runs_dir())
@@ -128,6 +145,41 @@ class PaperBench(PythonCodingEval):
             assert PAPER_ID_PATTERN.fullmatch(self.paper_id), (
                 f"Invalid PaperBench paper ID: {self.paper_id!r}"
             )
+        mode = self.resolved_requirements_mode()
+        assert mode in {
+            "none",
+            "self-generated",
+            "full",
+            "no-clarification",
+            "rubric-visible",
+        }
+        expects_csv = mode in {"full", "no-clarification"}
+        assert expects_csv == (self.requirements_csv is not None), (
+            "Requirements modes full and no-clarification require a CSV; none, "
+            "self-generated, and rubric-visible must not have one."
+        )
+        excluded_ids = self.requirements_excluded_ids()
+        assert len(excluded_ids) == len(set(excluded_ids)), (
+            "requirements_excluded_ids_json contains duplicate IDs"
+        )
+        if mode in {"none", "self-generated", "rubric-visible"}:
+            assert self.requirements_source_sha256 is None
+            assert self.requirements_source_count is None
+            assert excluded_ids == []
+        if mode == "no-clarification":
+            assert self.requirements_source_sha256 is not None
+            assert self.requirements_source_count is not None
+
+    def resolved_requirements_mode(self) -> str:
+        if self.requirements_mode == "auto":
+            return "full" if self.requirements_csv is not None else "none"
+        return self.requirements_mode
+
+    def requirements_excluded_ids(self) -> list[str]:
+        parsed = json.loads(self.requirements_excluded_ids_json)
+        if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+            raise ValueError("requirements_excluded_ids_json must be a JSON array of strings")
+        return parsed
 
     def selected_paper_ids(self) -> list[str]:
         if self.paper_id is not None:
@@ -136,12 +188,10 @@ class PaperBench(PythonCodingEval):
 
     @override
     async def get_instances(self) -> list[PBTask]:
-        """Tasks are papers * seeds, with the paper list from `self.paper_split` and seeds from `self.n_tries`."""
+        """Create tasks for the direct paper ID or split, multiplied by seeds."""
 
         if requires_grader_openai_api_key(self.judge.completer_config):
-            assert GRADER_OPENAI_API_KEY, (
-                "Environment variable `GRADER_OPENAI_API_KEY` is not set."
-            )
+            assert GRADER_OPENAI_API_KEY, "Environment variable `GRADER_OPENAI_API_KEY` is not set."
 
         ctx_logger = logger.bind(run_group_id=self.run_group_id, runs_dir=self.runs_dir)
 
@@ -167,9 +217,29 @@ class PaperBench(PythonCodingEval):
             if self.requirements_csv is not None
             else None
         )
+        requirements_mode = self.resolved_requirements_mode()
+        excluded_requirement_ids = self.requirements_excluded_ids()
+        source_requirements_sha256 = self.requirements_source_sha256
+        source_requirement_count = self.requirements_source_count
+        if requirements is not None and requirements_mode == "full":
+            source_requirements_sha256 = source_requirements_sha256 or requirements.sha256
+            source_requirement_count = source_requirement_count or requirements.requirement_count
+        if requirements is not None and requirements_mode == "no-clarification":
+            assert source_requirement_count is not None
+            assert source_requirement_count == (
+                requirements.requirement_count + len(excluded_requirement_ids)
+            ), "Source count must equal provided count plus excluded IDs"
         task_instructions = add_requirements_instruction(
             instructions.read_text(),
             requirements_provided=requirements is not None,
+        )
+        task_instructions = add_self_generated_requirements_instruction(
+            task_instructions,
+            self_generated=requirements_mode == "self-generated",
+        )
+        task_instructions = add_evaluation_specification_instruction(
+            task_instructions,
+            rubric_visible=requirements_mode == "rubric-visible",
         )
 
         # populate tasks with all the run_ids
@@ -217,6 +287,10 @@ class PaperBench(PythonCodingEval):
                         requirements_count=(
                             requirements.requirement_count if requirements is not None else 0
                         ),
+                        requirements_mode=requirements_mode,
+                        source_requirements_sha256=source_requirements_sha256,
+                        source_requirement_count=source_requirement_count or 0,
+                        excluded_requirement_ids=excluded_requirement_ids,
                         network_mode=NetworkMode.UNPROXIED
                         if self.allow_internet
                         else NetworkMode.NONE,
@@ -269,18 +343,27 @@ class PaperBench(PythonCodingEval):
             "code_only": self.judge.code_only,
             "resources_provided": self.judge.resources_provided,
             "agent": self.solver.shortname(),
-            "requirements_csv_provided": self.requirements_csv is not None,
-            "requirements_csv_sha256": (
+            "requirements_mode": self.resolved_requirements_mode(),
+            "provided_requirements_sha256": (
                 requirements_task.requirements_csv_sha256
-                if requirements_task is not None
-                and requirements_task.requirements_csv is not None
+                if requirements_task is not None and requirements_task.requirements_csv is not None
                 else None
             ),
-            "requirements_count": (
+            "provided_requirement_count": (
                 requirements_task.requirements_count
-                if requirements_task is not None
-                and requirements_task.requirements_csv is not None
+                if requirements_task is not None and requirements_task.requirements_csv is not None
                 else 0
+            ),
+            "source_requirements_sha256": (
+                requirements_task.source_requirements_sha256
+                if requirements_task is not None
+                else None
+            ),
+            "source_requirement_count": (
+                requirements_task.source_requirement_count if requirements_task is not None else 0
+            ),
+            "excluded_requirement_ids": (
+                requirements_task.excluded_requirement_ids if requirements_task is not None else []
             ),
         }
 

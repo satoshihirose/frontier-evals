@@ -313,7 +313,7 @@ class BasicAgentSolver(BasePBSolver):
         await sanity_check_docker(computer)
 
         start_time = time.time()
-        instructions = await get_instructions(computer, task, self.iterative_agent, self.time_limit)
+        instructions = await get_instructions(computer, task, self.time_limit)
         system_message = get_system_message(self.iterative_agent, task.judge.code_only)
         await self._execute_agent_and_periodically_upload_logs(
             computer=computer,

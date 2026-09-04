@@ -55,11 +55,25 @@ async def run_reproduce_script(
         cmd_str += " && python3 -m venv venv && source venv/bin/activate"
     cmd_str += " && bash reproduce.sh 2>&1 | tee reproduce.log'"
 
+    command_timeout = timeout
+    if timeout is not None:
+        # Enforce the deadline inside the reproducer so the shell pipeline is stopped and
+        # reaped before archiving. Cancelling only send_shell_command can leave `tee`
+        # writing reproduce.log, which makes tar fail and prevents the salvage retry.
+        timeout_seconds = f"{timeout:g}"
+        cmd_str = (
+            f"timeout --signal=TERM --kill-after=30s {timeout_seconds}s {cmd_str}"
+        )
+        command_timeout = timeout + 60
+
     repro_start_time = time.time()
     # run reproduce.sh with timeout
     timedout = False
     try:
-        result = await asyncio.wait_for(computer.send_shell_command(cmd_str), timeout=timeout)
+        result = await asyncio.wait_for(
+            computer.send_shell_command(cmd_str), timeout=command_timeout
+        )
+        timedout = timeout is not None and result.exit_code in {124, 137}
         ctx_logger.info(f"Reproduction script output: {result.output.decode('utf-8')}")
     except asyncio.TimeoutError:
         timedout = True
@@ -317,7 +331,7 @@ async def reproduce_on_computer_with_salvaging(
         repro_attempts.append(repro_attempt)
         if _should_retry(retries_enabled, repro_attempt, retry_threshold):
             ctx_logger.info(
-                f"Reproduction attempt ran for less than {retry_threshold} seconds,"
+                f"Reproduction attempt ended before {retry_threshold} seconds,"
                 " retrying with different configuration."
             )
             continue  # retry, with next configuration
@@ -364,9 +378,9 @@ async def reproduce_on_computer_with_salvaging(
 def _should_retry(
     retries_enabled: bool, repro_attempt: ReproductionMetadata, retry_threshold: float
 ) -> bool:
-    """helper for determining whether we should retry to run reproduce.sh"""
+    """Retry only early exits; a timeout has already consumed the full run budget."""
     execution_time = repro_attempt.repro_execution_time or 0
-    return retries_enabled and execution_time < retry_threshold
+    return retries_enabled and not repro_attempt.timedout and execution_time < retry_threshold
 
 
 def _populate_retried_results(

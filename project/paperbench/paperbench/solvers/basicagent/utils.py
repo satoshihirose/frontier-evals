@@ -1,7 +1,6 @@
 import asyncio
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import structlog
@@ -29,7 +28,6 @@ from paperbench.solvers.basicagent.prompts.templates import (
 )
 from paperbench.solvers.basicagent.tools.base import Tool, ToolCall
 from paperbench.solvers.upload import upload_heavy_logs
-from paperbench.utils import get_root
 
 logger = structlog.stdlib.get_logger(component=__name__)
 
@@ -158,51 +156,58 @@ async def get_gpu_generation(computer: ComputerInterface) -> str | None:
     return ", ".join([info.strip() for info in generation])
 
 
-async def get_instructions(
-    computer: ComputerInterface,
-    task: PBTask,
-    iterative_agent: bool,
+def get_task_instruction_text(task: PBTask) -> str:
+    """Return the task contract assembled by PaperBench for every solver."""
+    if not task.prompt:
+        raise ValueError(f"Missing prompt in run {task.run_id!r}")
+    instructions = task.prompt[0].get("content")
+    if instructions is None:
+        raise ValueError(f"Missing prompt content in run {task.run_id!r}")
+    if not isinstance(instructions, str):
+        raise TypeError(
+            f"Expected prompt content to be str, got {type(instructions).__name__!r}"
+        )
+    return instructions
+
+
+def build_user_instructions(
+    *,
+    base_instructions: str,
     time_limit: float | None,
+    gpu_generation: str | None,
 ) -> str:
-    """
-    Prepares instructions for the agent. The instructions vary depending on whether:
-    - The task is the default task or code-only
-    - The agent is the default agent or iterative
-    """
-    if iterative_agent:
-        if task.judge.code_only:
-            instructions_path = (
-                Path(__file__).parent.resolve() / "prompts" / "code_only_instructions_iterative.txt"
-            )
-        else:
-            instructions_path = (
-                Path(__file__).parent.resolve() / "prompts" / "instructions_iterative.txt"
-            )
-    else:
-        if task.judge.code_only:
-            instructions_path = get_root() / "instructions" / "code_only_instructions.txt"
-        else:
-            instructions_path = get_root() / "instructions" / "instructions.txt"
-
-    instructions = instructions_path.read_text()
-
-    # add additional notes
-    type_of_processor = await get_gpu_generation(computer)
-    if type_of_processor:
-        type_of_processor_str = gpu_template.format(type_of_processor=type_of_processor)
-    else:
-        type_of_processor_str = no_gpu_template
+    """Add the runtime context shared by PaperBench Agent harnesses."""
+    type_of_processor_str = (
+        gpu_template.format(type_of_processor=gpu_generation)
+        if gpu_generation
+        else no_gpu_template
+    )
     if time_limit:
         time_limit_in_hours = round(time_limit / 3600, 3)
         time_limit_str = time_limit_template.format(max_time_in_hours=time_limit_in_hours)
     else:
         time_limit_str = no_time_limit_template.format()
-    instructions += additional_notes_template.format(
+    runtime_context = additional_notes_template.format(
         type_of_processor_str=type_of_processor_str,
         time_limit_str=time_limit_str,
         workspace_base=WORKSPACE_BASE,
     )
-    return instructions
+    return f"{base_instructions.rstrip()}\n{runtime_context}"
+
+
+async def get_instructions(
+    computer: ComputerInterface,
+    task: PBTask,
+    time_limit: float | None,
+) -> str:
+    """Append runtime context to the task contract shared by every solver."""
+    instructions = get_task_instruction_text(task)
+    type_of_processor = await get_gpu_generation(computer)
+    return build_user_instructions(
+        base_instructions=instructions,
+        time_limit=time_limit,
+        gpu_generation=type_of_processor,
+    )
 
 
 def _handle_message_len(

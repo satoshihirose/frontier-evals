@@ -179,7 +179,9 @@ class ReproductionConfig(BaseModel):
     skip_reproduction: bool = False
     computer_runtime: ComputerRuntime = AlcatrazComputerRuntime()
     computer_config: ComputerConfiguration = ComputerConfiguration(
-        docker_image="pb-reproducer:latest", network_mode=NetworkMode.UNPROXIED
+        docker_image="pb-reproducer:latest",
+        shm_size="8g",
+        network_mode=NetworkMode.UNPROXIED,
     )
     runtime_config: PBRuntimeConfig = AlcatrazPBRuntimeConfig()
 

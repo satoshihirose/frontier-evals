@@ -35,7 +35,10 @@ async def put_submission_in_computer(
         run_group_id=run_group_id, runs_dir=runs_dir, run_id=run_id, destinations=["run"]
     )
     ctx_logger.info(f"Placing submission in computer from: {submission_path}")
-    tar_gz_on_computer = "/tmp/logs.tar.gz"
+    # /tmp can be a shared host bind mount for concurrent reproduction containers.
+    # A unique upload name prevents one run from replacing another run's archive.
+    transfer_id = uuid.uuid4().hex
+    tar_gz_on_computer = f"/tmp/pb_submission_{transfer_id}.tar.gz"
     # Put the tar.gz to the container
     await put_file_in_computer(
         computer=computer,
@@ -47,8 +50,11 @@ async def put_submission_in_computer(
     )
 
     # Extract tar.gz into a unique temp dir to avoid collisions.
-    extract_dir = f"/tmp/pb_extract_{uuid.uuid4().hex}"
-    cmd = f"mkdir -p {extract_dir} && tar -xzf {tar_gz_on_computer} -C {extract_dir}"
+    extract_dir = f"/tmp/pb_extract_{transfer_id}"
+    cmd = (
+        f"mkdir -p {extract_dir} && tar -xzf {tar_gz_on_computer} -C {extract_dir}; "
+        f"status=$?; rm -f {tar_gz_on_computer}; exit $status"
+    )
     ctx_logger.info(f"Extracting submission: {cmd}")
     result = await computer.check_shell_command(cmd)
 

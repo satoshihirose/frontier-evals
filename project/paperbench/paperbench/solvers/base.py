@@ -174,6 +174,9 @@ class BasePBSolver(PythonCodingSolver, ABC):
             with bf.BlobFile(bf.join(task.run_dir, "metadata.json"), "w") as f:
                 metadata = agent_output.model_dump()
                 metadata["requirements_input"] = task.requirements_input_metadata()
+                metadata["evaluation_specification"] = (
+                    task.evaluation_specification_metadata()
+                )
                 json.dump(metadata, f, indent=4)
             await self._sanity_check_submission(task)
         except Exception as e:

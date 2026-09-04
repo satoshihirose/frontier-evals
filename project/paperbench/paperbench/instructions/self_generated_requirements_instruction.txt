@@ -3,9 +3,10 @@ SELF-GENERATED REPRODUCTION REQUIREMENTS
 Before writing or modifying implementation code, create a reproduction
 Requirements checklist at
 `/home/submission/self_generated_requirements.csv` using the paper, addendum,
-supplied assets, and online resources. Do not inspect or use the paper's
-official codebase, any mirror, fork, or derivative of it, or any resource listed
-in `blacklist.txt`.
+supplied assets, permitted online resources, and all reproduction-defining
+constraints stated in the task instructions above. Do not inspect or use the
+paper's official codebase, any mirror, fork, or derivative of it, or any resource
+listed in `blacklist.txt`.
 
 A reproduction Requirement is one atomic pre-execution choice for which the
 in-scope procedure admits two or more plausible values or implementations,
@@ -13,6 +14,23 @@ including implicit library defaults. Include the choice only when replacing the
 selected option with another plausible option could materially change execution
 success, experimental input membership or content, a method prediction or
 intermediate representation, an evaluation value, or a required artifact.
+
+Before examining paper-specific choices, extract concrete benchmark task contracts
+fixed by the task instructions, such as the reproduction entrypoint,
+fresh-environment regeneration, required committed source and configuration, and
+submission cleanup or path-portability rules. Do not turn broad objectives,
+motivational language, or runtime context into Requirements.
+
+Consult a cited source only when the target paper explicitly delegates that missing
+choice to it. A mere citation or attribution, including the origin of software, a
+library, repository, model, or dataset, does not transfer the cited source's
+internal defaults or settings to the target reproduction.
+
+Treat pure scope exclusions as filters, not negative Requirements. Exclude
+appendix-only experiments, but retain appendix implementation details for an
+in-scope main-body experiment. Prefer an addendum value over a paper value only
+when the addendum explicitly corrects or replaces it; later source position alone
+does not establish a correction.
 
 Each row must contain these columns:
 
