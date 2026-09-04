@@ -31,12 +31,20 @@ from paperbench.solvers.basicagent.utils import (
     get_gpu_generation,
     get_task_instruction_text,
 )
+from paperbench.solvers.completion_review import (
+    DEFAULT_MIN_REMAINING_SECONDS,
+    build_completion_review_prompt,
+    remaining_budget_seconds,
+    snapshot_initial_submission,
+    write_completion_review_metadata,
+)
 from paperbench.solvers.upload import upload_heavy_logs, upload_status
 from paperbench.solvers.utils import check_for_existing_run, sanity_check_docker
 
 logger = structlog.stdlib.get_logger(component=__name__)
 
 CODEX_EVENT_LOG = f"{LOGS_DIR}/codex-events.jsonl"
+CODEX_REVIEW_EVENT_LOG = f"{LOGS_DIR}/codex-review-events.jsonl"
 CODEX_ROLLOUT_METADATA = f"{LOGS_DIR}/codex-rollout.json"
 URL_OBSERVATIONS_FILENAME = "url-observations.jsonl"
 CODEX_HOME = f"{WORKSPACE_BASE}/.codex"
@@ -174,6 +182,7 @@ def build_codex_command(
     reasoning_summary: ReasoningSummary,
     time_limit: int,
     developer_instructions: str,
+    ephemeral: bool = True,
 ) -> str:
     """Build the non-interactive Codex command executed in the agent container."""
     if time_limit <= 0:
@@ -200,17 +209,73 @@ def build_codex_command(
         f'model_reasoning_summary="{reasoning_summary}"',
         "-c",
         f"developer_instructions={json.dumps(developer_instructions)}",
-        "--ephemeral",
         "--ignore-user-config",
         "--skip-git-repo-check",
         "--json",
         "--dangerously-bypass-approvals-and-sandbox",
         "-",
     ]
+    if ephemeral:
+        args.insert(args.index("--ignore-user-config"), "--ephemeral")
     return (
         f"{shlex.join(args)} < {shlex.quote(INSTRUCTIONS_PATH)} "
         f"> {shlex.quote(CODEX_EVENT_LOG)} 2>&1"
     )
+
+
+def extract_codex_thread_id(event_log: bytes) -> str | None:
+    for raw_line in event_log.splitlines():
+        try:
+            event = json.loads(raw_line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(event, dict) or event.get("type") != "thread.started":
+            continue
+        thread_id = event.get("thread_id")
+        if isinstance(thread_id, str) and thread_id:
+            return thread_id
+    return None
+
+
+def build_codex_resume_command(
+    *,
+    thread_id: str,
+    prompt: str,
+    model: str,
+    reasoning_effort: ReasoningEffort,
+    reasoning_summary: ReasoningSummary,
+    time_limit: int,
+) -> str:
+    if not thread_id:
+        raise ValueError("thread_id must be non-empty")
+    if time_limit <= 0:
+        raise ValueError("time_limit must be positive")
+    args = [
+        "env",
+        "-u",
+        "OPENAI_API_KEY",
+        f"CODEX_HOME={CODEX_HOME}",
+        "timeout",
+        "--signal=TERM",
+        "--kill-after=30s",
+        f"{time_limit}s",
+        "codex",
+        "exec",
+        "resume",
+        "--model",
+        model,
+        "-c",
+        f'model_reasoning_effort="{reasoning_effort}"',
+        "-c",
+        f'model_reasoning_summary="{reasoning_summary}"',
+        "--ignore-user-config",
+        "--skip-git-repo-check",
+        "--json",
+        "--dangerously-bypass-approvals-and-sandbox",
+        thread_id,
+        prompt,
+    ]
+    return f"{shlex.join(args)} > {shlex.quote(CODEX_REVIEW_EVENT_LOG)} 2>&1"
 
 
 @chz.chz
@@ -241,6 +306,14 @@ class CodexSolver(BasePBSolver):
     upload_interval_seconds: float | None = chz.field(
         default=1800,
         doc="Seconds between submission checkpoints; set to null to disable",
+    )
+    completion_review: bool = chz.field(
+        default=False,
+        doc="Resume a completed rollout once to review its submission",
+    )
+    completion_review_min_remaining_seconds: int = chz.field(
+        default=DEFAULT_MIN_REMAINING_SECONDS,
+        doc="Minimum original rollout budget required before starting the review",
     )
 
     @override
@@ -331,9 +404,14 @@ class CodexSolver(BasePBSolver):
             if os.path.exists(temporary_path):
                 os.unlink(temporary_path)
 
-    async def _read_event_log(self, computer: ComputerInterface, fallback: bytes) -> bytes:
+    async def _read_event_log(
+        self,
+        computer: ComputerInterface,
+        fallback: bytes,
+        path: str = CODEX_EVENT_LOG,
+    ) -> bytes:
         try:
-            return await computer.download(CODEX_EVENT_LOG)
+            return await computer.download(path)
         except Exception as exc:
             logger.exception(f"Could not download Codex event log: {exc}")
             return fallback or f"Codex event log unavailable: {exc}\n".encode()
@@ -426,6 +504,7 @@ class CodexSolver(BasePBSolver):
                 iterative=False,
                 code_only=task.judge.code_only,
             ),
+            ephemeral=not self.completion_review,
         )
         exit_code: int | None = None
         command_output = b""
@@ -448,8 +527,91 @@ class CodexSolver(BasePBSolver):
             error_msg = f"Codex rollout failed: {exc}"
             logger.exception(error_msg)
 
-        end_time = time.time()
         event_log = await self._read_event_log(computer, command_output)
+        initial_exit_code = exit_code
+        completion_review_metadata: dict[str, object] = {
+            "enabled": self.completion_review,
+            "performed": False,
+            "minimum_remaining_seconds": self.completion_review_min_remaining_seconds,
+            "initial_submission": None,
+        }
+        if self.completion_review and exit_code == 0:
+            remaining_seconds = remaining_budget_seconds(
+                time_limit_seconds=self.time_limit,
+                start_time=start_time,
+                now=time.time(),
+            )
+            completion_review_metadata["remaining_seconds_at_decision"] = remaining_seconds
+            if remaining_seconds < self.completion_review_min_remaining_seconds:
+                completion_review_metadata["skip_reason"] = "insufficient-original-budget"
+            else:
+                thread_id = extract_codex_thread_id(event_log)
+                if thread_id is None:
+                    completion_review_metadata["skip_reason"] = "missing-codex-thread-id"
+                else:
+                    await upload_heavy_logs(
+                        computer=computer,
+                        agent_start_time=int(start_time),
+                        agent_dir_config=AGENT_DIR_CONFIG,
+                        run_dir=task.run_dir,
+                        run_group_id=task.run_group_id,
+                        runs_dir=task.runs_dir,
+                        run_id=task.run_id,
+                        runtime=time.time() - start_time,
+                    )
+                    initial_submission = snapshot_initial_submission(task.run_dir)
+                    review_prompt = build_completion_review_prompt(remaining_seconds)
+                    review_command = build_codex_resume_command(
+                        thread_id=thread_id,
+                        prompt=review_prompt,
+                        model=self.model,
+                        reasoning_effort=self.reasoning_effort,
+                        reasoning_summary=self.reasoning_summary,
+                        time_limit=remaining_seconds,
+                    )
+                    review_started_at = time.time()
+                    try:
+                        review_result = await self._execute_with_checkpoints(
+                            computer=computer,
+                            task=task,
+                            command=review_command,
+                            start_time=start_time,
+                        )
+                        review_log = await self._read_event_log(
+                            computer,
+                            review_result.output,
+                            CODEX_REVIEW_EVENT_LOG,
+                        )
+                        event_log = event_log.rstrip() + b"\n" + review_log
+                        exit_code = review_result.exit_code
+                        if exit_code == 124:
+                            error_msg = (
+                                "Codex completion review exhausted the remaining original budget"
+                            )
+                        elif exit_code != 0:
+                            error_msg = f"Codex completion review exited with status {exit_code}"
+                        else:
+                            error_msg = None
+                    except Exception as exc:
+                        exit_code = 1
+                        error_msg = f"Codex completion review failed: {exc}"
+                        logger.exception(error_msg)
+                    completion_review_metadata.update(
+                        {
+                            "performed": True,
+                            "thread_id": thread_id,
+                            "prompt": review_prompt,
+                            "remaining_seconds_at_start": remaining_seconds,
+                            "started_at": review_started_at,
+                            "finished_at": time.time(),
+                            "exit_code": exit_code,
+                            "initial_submission": initial_submission,
+                        }
+                    )
+
+        end_time = time.time()
+        if self.completion_review:
+            write_completion_review_metadata(task.run_dir, completion_review_metadata)
         self._write_run_logs(task, event_log)
         try:
             await self._persist_refreshed_auth(computer)
@@ -467,11 +629,13 @@ class CodexSolver(BasePBSolver):
             "time_end": end_time,
             "runtime_in_seconds": end_time - start_time,
             "exit_code": exit_code,
+            "initial_exit_code": initial_exit_code,
             "error_msg": error_msg,
             "command": command,
             "gpu_generation": gpu_generation,
             "operating_instructions": "basicagent_system_as_codex_developer",
             "url_observations_file": URL_OBSERVATIONS_FILENAME,
+            "completion_review": completion_review_metadata,
         }
         await computer.upload(
             json.dumps(rollout_metadata, indent=2).encode(),

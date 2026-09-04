@@ -265,6 +265,19 @@ For an initial code-only smoke test, add `paperbench.judge.code_only=True`. The 
 runs inside PaperBench, so rollout time, logs, blacklist monitoring, and submission capture
 retain their normal benchmark meaning.
 
+For a completion-persistence intervention, both `CodexSolver` and the iterative
+`BasicAgentSolver` accept `completion_review=True`. At the first normal completion, the solver
+preserves `initial-submission.tar.gz` and, when at least 1,800 seconds of the original rollout
+budget remain, continues the same session once using only that remaining budget. The concise
+review instruction reports the remaining minutes and asks the Agent to check for omitted
+in-scope experiments and incomplete end-to-end paths; if the paper is already fully reproduced,
+it may finish without changes. This is opt-in and does not add time beyond the original limit.
+
+PaperBench also supports `paperbench.requirements_mode=rubric-criteria`. This uploads
+`/home/paper/rubric_criteria.json`, a flat JSON array of the rubric leaves' `requirements` text
+copied verbatim. Weights, hierarchy, IDs, `judge.addendum.md`, and grader-only fields are not
+included. The mode is distinct from `rubric-visible`, which exposes the raw evaluation files.
+
 #### Supplying reproduction Requirements
 
 PaperBench can optionally provide a generated Requirements CSV as an additional agent input.

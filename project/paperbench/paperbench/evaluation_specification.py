@@ -1,7 +1,11 @@
+import json
+from typing import Any
+
 from paperbench.constants import WORKSPACE_BASE
 
 RUBRIC_CONTAINER_PATH = f"{WORKSPACE_BASE}/paper/rubric.json"
 JUDGE_ADDENDUM_CONTAINER_PATH = f"{WORKSPACE_BASE}/paper/judge.addendum.md"
+RUBRIC_CRITERIA_CONTAINER_PATH = f"{WORKSPACE_BASE}/paper/rubric_criteria.json"
 
 RUBRIC_VISIBLE_INSTRUCTION = """## Additional evaluation specification
 
@@ -14,10 +18,50 @@ When `judge.addendum.md` is present, it may contain benchmark-specific clarifica
 All other submission and reproduction instructions remain unchanged.
 """
 
+RUBRIC_CRITERIA_INSTRUCTION = f"""## Evaluation criteria
 
-def add_evaluation_specification_instruction(
-    instructions: str, *, rubric_visible: bool
-) -> str:
-    if not rubric_visible:
+`{RUBRIC_CRITERIA_CONTAINER_PATH}` contains the leaf evaluation criteria, copied verbatim from the evaluation rubric and flattened into one JSON array.
+
+Use these criteria when planning, implementing, and validating the reproduction. The file does not include rubric weights, hierarchy, identifiers, or grader-only explanations. The paper and the other supplied task materials remain the authoritative description of the work.
+"""
+
+
+def flatten_rubric_criteria(rubric: dict[str, Any]) -> list[str]:
+    """Return leaf requirement text in source tree order without rewriting it."""
+    criteria: list[str] = []
+
+    def visit(node: dict[str, Any]) -> None:
+        children = node.get("sub_tasks")
+        if not isinstance(children, list):
+            raise ValueError("Every rubric node must contain a sub_tasks list")
+        if not children:
+            requirement = node.get("requirements")
+            if not isinstance(requirement, str) or not requirement:
+                raise ValueError("Every rubric leaf must contain non-empty requirements text")
+            criteria.append(requirement)
+            return
+        for child in children:
+            if not isinstance(child, dict):
+                raise ValueError("Rubric sub_tasks must contain objects")
+            visit(child)
+
+    visit(rubric)
+    return criteria
+
+
+def serialize_rubric_criteria(rubric_content: bytes) -> bytes:
+    rubric = json.loads(rubric_content)
+    if not isinstance(rubric, dict):
+        raise ValueError("Rubric root must be an object")
+    criteria = flatten_rubric_criteria(rubric)
+    return (json.dumps(criteria, ensure_ascii=False, indent=2) + "\n").encode()
+
+
+def add_evaluation_specification_instruction(instructions: str, *, mode: str) -> str:
+    if mode == "rubric-visible":
+        appended = RUBRIC_VISIBLE_INSTRUCTION
+    elif mode == "rubric-criteria":
+        appended = RUBRIC_CRITERIA_INSTRUCTION
+    else:
         return instructions
-    return f"{instructions.rstrip()}\n\n{RUBRIC_VISIBLE_INSTRUCTION}"
+    return f"{instructions.rstrip()}\n\n{appended}"

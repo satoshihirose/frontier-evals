@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from paperbench.solvers.basicagent.solver import BasicAgentSolver
 from paperbench.solvers.basicagent.utils import get_task_instruction_text
 
 
@@ -28,3 +29,10 @@ def test_basicagent_rejects_an_invalid_task_prompt(prompt: object) -> None:
 
     with pytest.raises((TypeError, ValueError)):
         get_task_instruction_text(task)
+
+
+def test_completion_review_is_opt_in_with_a_fixed_thirty_minute_floor() -> None:
+    solver = BasicAgentSolver()
+
+    assert solver.completion_review is False
+    assert solver.completion_review_min_remaining_seconds == 1800

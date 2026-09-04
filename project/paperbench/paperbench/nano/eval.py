@@ -152,17 +152,18 @@ class PaperBench(PythonCodingEval):
             "full",
             "no-clarification",
             "rubric-visible",
+            "rubric-criteria",
         }
         expects_csv = mode in {"full", "no-clarification"}
         assert expects_csv == (self.requirements_csv is not None), (
             "Requirements modes full and no-clarification require a CSV; none, "
-            "self-generated, and rubric-visible must not have one."
+            "self-generated, rubric-visible, and rubric-criteria must not have one."
         )
         excluded_ids = self.requirements_excluded_ids()
         assert len(excluded_ids) == len(set(excluded_ids)), (
             "requirements_excluded_ids_json contains duplicate IDs"
         )
-        if mode in {"none", "self-generated", "rubric-visible"}:
+        if mode in {"none", "self-generated", "rubric-visible", "rubric-criteria"}:
             assert self.requirements_source_sha256 is None
             assert self.requirements_source_count is None
             assert excluded_ids == []
@@ -239,7 +240,7 @@ class PaperBench(PythonCodingEval):
         )
         task_instructions = add_evaluation_specification_instruction(
             task_instructions,
-            rubric_visible=requirements_mode == "rubric-visible",
+            mode=requirements_mode,
         )
 
         # populate tasks with all the run_ids

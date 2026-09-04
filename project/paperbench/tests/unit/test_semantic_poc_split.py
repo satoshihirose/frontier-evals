@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from typing import cast
 
@@ -7,8 +8,10 @@ from nanoeval.solvers.computer_tasks.code_execution_interface import ComputerInt
 from paperbench.evaluation_specification import (
     JUDGE_ADDENDUM_CONTAINER_PATH,
     RUBRIC_CONTAINER_PATH,
+    RUBRIC_CRITERIA_CONTAINER_PATH,
 )
 from paperbench.nano.eval import PaperBench
+from paperbench.paper_registry import paper_registry
 from paperbench.requirements import REQUIREMENTS_CONTAINER_PATH
 from paperbench.solvers.codex.solver import CodexSolver
 from paperbench.utils import get_experiments_dir
@@ -148,8 +151,11 @@ async def test_non_rubric_mode_does_not_expose_evaluation_files(
     assert computer.uploads == {}
     assert tasks[0].evaluation_specification_metadata() == {
         "visible": False,
+        "mode": None,
         "rubric_container_path": None,
         "rubric_sha256": None,
+        "criteria_container_path": None,
+        "criterion_count": 0,
         "judge_addendum_container_path": None,
         "judge_addendum_sha256": None,
     }
@@ -176,6 +182,57 @@ async def test_rubric_visible_mode_allows_missing_judge_addendum(
     assert metadata["rubric_sha256"]
     assert metadata["judge_addendum_container_path"] is None
     assert metadata["judge_addendum_sha256"] is None
+
+
+@pytest.mark.asyncio
+async def test_rubric_criteria_mode_exposes_only_verbatim_flat_leaf_text(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr("paperbench.nano.eval.GRADER_OPENAI_API_KEY", "test-key")
+    tasks = await PaperBench(
+        paper_id="adaptive-pruning",
+        solver=CodexSolver(),
+        runs_dir=str(tmp_path),
+        requirements_mode="rubric-criteria",
+    ).get_instances()
+
+    prompt_content = tasks[0].prompt[0]["content"]
+    assert isinstance(prompt_content, str)
+    assert "## Evaluation criteria" in prompt_content
+    assert "rubric_criteria.json" in prompt_content
+    criteria_section = prompt_content.split("## Evaluation criteria", maxsplit=1)[1]
+    assert "rubric.json" not in criteria_section
+    assert "judge.addendum.md" not in criteria_section
+
+    computer = RecordingComputer()
+    await tasks[0]._setup_evaluation_specification(cast(ComputerInterface, computer))
+
+    assert set(computer.uploads) == {RUBRIC_CRITERIA_CONTAINER_PATH}
+    criteria = json.loads(computer.uploads[RUBRIC_CRITERIA_CONTAINER_PATH])
+    rubric = json.loads(paper_registry.get_paper("adaptive-pruning").rubric.read_text())
+
+    expected: list[str] = []
+
+    def collect(node: dict[str, object]) -> None:
+        children = node.get("sub_tasks")
+        assert isinstance(children, list)
+        if not children:
+            requirement = node.get("requirements")
+            assert isinstance(requirement, str)
+            expected.append(requirement)
+            return
+        for child in children:
+            assert isinstance(child, dict)
+            collect(child)
+
+    collect(rubric)
+    assert criteria == expected
+    metadata = tasks[0].evaluation_specification_metadata()
+    assert metadata["mode"] == "rubric-criteria"
+    assert metadata["criterion_count"] == len(expected)
+    assert metadata["rubric_container_path"] is None
+    assert metadata["judge_addendum_container_path"] is None
+    assert metadata["criteria_container_path"] == RUBRIC_CRITERIA_CONTAINER_PATH
 
 
 @pytest.mark.asyncio

@@ -35,6 +35,9 @@ from paperbench.constants import (
 from paperbench.evaluation_specification import (
     JUDGE_ADDENDUM_CONTAINER_PATH,
     RUBRIC_CONTAINER_PATH,
+    RUBRIC_CRITERIA_CONTAINER_PATH,
+    flatten_rubric_criteria,
+    serialize_rubric_criteria,
 )
 from paperbench.grade import JudgeOutput, grade_submission
 from paperbench.monitor.monitor import Monitor, MonitorResult
@@ -113,23 +116,25 @@ class PBTask(ComputerTask):
         await computer.check_shell_command(f"chmod 0444 {REQUIREMENTS_CONTAINER_PATH}")
 
     async def _setup_evaluation_specification(self, computer: ComputerInterface) -> None:
-        if self.requirements_mode != "rubric-visible":
+        if self.requirements_mode not in {"rubric-visible", "rubric-criteria"}:
             return
 
         paper = paper_registry.get_paper(self.paper_id)
         if not paper.rubric.is_file():
-            raise FileNotFoundError(
-                f"Rubric-visible mode requires a rubric.json: {paper.rubric}"
+            raise FileNotFoundError(f"Rubric-visible mode requires a rubric.json: {paper.rubric}")
+        if self.requirements_mode == "rubric-criteria":
+            await computer.upload(
+                serialize_rubric_criteria(paper.rubric.read_bytes()),
+                RUBRIC_CRITERIA_CONTAINER_PATH,
             )
+            await computer.check_shell_command(f"chmod 0444 {RUBRIC_CRITERIA_CONTAINER_PATH}")
+            return
+
         await computer.upload(paper.rubric.read_bytes(), RUBRIC_CONTAINER_PATH)
         await computer.check_shell_command(f"chmod 0444 {RUBRIC_CONTAINER_PATH}")
         if paper.judge_addendum.is_file():
-            await computer.upload(
-                paper.judge_addendum.read_bytes(), JUDGE_ADDENDUM_CONTAINER_PATH
-            )
-            await computer.check_shell_command(
-                f"chmod 0444 {JUDGE_ADDENDUM_CONTAINER_PATH}"
-            )
+            await computer.upload(paper.judge_addendum.read_bytes(), JUDGE_ADDENDUM_CONTAINER_PATH)
+            await computer.check_shell_command(f"chmod 0444 {JUDGE_ADDENDUM_CONTAINER_PATH}")
 
     @override
     async def _setup(self, computer: ComputerInterface, runtime_config: RuntimeConfig) -> None:
@@ -205,7 +210,7 @@ class PBTask(ComputerTask):
         }
 
     def evaluation_specification_metadata(self) -> dict[str, object]:
-        visible = self.requirements_mode == "rubric-visible"
+        visible = self.requirements_mode in {"rubric-visible", "rubric-criteria"}
         paper = paper_registry.get_paper(self.paper_id)
 
         def digest(path: Path) -> str | None:
@@ -214,11 +219,25 @@ class PBTask(ComputerTask):
             return hashlib.sha256(path.read_bytes()).hexdigest()
 
         rubric_sha256 = digest(paper.rubric)
-        judge_addendum_sha256 = digest(paper.judge_addendum)
+        criteria = (
+            flatten_rubric_criteria(json.loads(paper.rubric.read_text()))
+            if self.requirements_mode == "rubric-criteria"
+            else []
+        )
+        judge_addendum_sha256 = (
+            digest(paper.judge_addendum) if self.requirements_mode == "rubric-visible" else None
+        )
         return {
             "visible": visible,
-            "rubric_container_path": RUBRIC_CONTAINER_PATH if rubric_sha256 else None,
+            "mode": self.requirements_mode if visible else None,
+            "rubric_container_path": (
+                RUBRIC_CONTAINER_PATH
+                if rubric_sha256 and self.requirements_mode == "rubric-visible"
+                else None
+            ),
             "rubric_sha256": rubric_sha256,
+            "criteria_container_path": (RUBRIC_CRITERIA_CONTAINER_PATH if criteria else None),
+            "criterion_count": len(criteria),
             "judge_addendum_container_path": (
                 JUDGE_ADDENDUM_CONTAINER_PATH if judge_addendum_sha256 else None
             ),

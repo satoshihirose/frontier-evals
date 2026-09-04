@@ -29,13 +29,21 @@ from paperbench.solvers.codex.solver import (
     CODEX_EVENT_LOG,
     CODEX_HOME,
     CODEX_HOME_PREPARE_COMMAND,
+    CODEX_REVIEW_EVENT_LOG,
     CODEX_ROLLOUT_METADATA,
     INSTRUCTIONS_PATH,
     URL_OBSERVATIONS_FILENAME,
     CodexSolver,
     build_codex_command,
+    build_codex_resume_command,
     build_codex_user_instructions,
+    extract_codex_thread_id,
     extract_url_observations,
+)
+from paperbench.solvers.completion_review import (
+    DEFAULT_MIN_REMAINING_SECONDS,
+    build_completion_review_prompt,
+    remaining_budget_seconds,
 )
 
 
@@ -45,6 +53,7 @@ class FakeComputer(ComputerInterface):
         *,
         exit_code: int = 0,
         event_log: bytes = b'{"type":"done"}\n',
+        review_event_log: bytes = b'{"type":"turn.completed"}\n',
         auth_exit_code: int = 0,
         version_exit_code: int = 0,
         command_delay: float = 0,
@@ -52,6 +61,7 @@ class FakeComputer(ComputerInterface):
     ) -> None:
         self.exit_code = exit_code
         self.event_log = event_log
+        self.review_event_log = review_event_log
         self.auth_exit_code = auth_exit_code
         self.version_exit_code = version_exit_code
         self.command_delay = command_delay
@@ -70,6 +80,8 @@ class FakeComputer(ComputerInterface):
     async def download(self, file: str) -> bytes:
         if file == CODEX_AUTH_PATH:
             return self.refreshed_auth
+        if file == CODEX_REVIEW_EVENT_LOG:
+            return self.review_event_log
         assert file == CODEX_EVENT_LOG
         self.download_count += 1
         return self.event_log
@@ -114,6 +126,10 @@ def make_task(tmp_path: Path) -> PBTask:
                 "sha256": "abc123",
                 "requirement_count": 2,
                 "container_path": "/home/requirements/requirements.csv",
+            },
+            evaluation_specification_metadata=lambda: {
+                "visible": False,
+                "mode": None,
             },
             prompt=[{"role": "user", "content": "BASE PAPERBENCH TASK\n"}],
             paper_id="semantic-self-consistency",
@@ -193,6 +209,39 @@ def test_build_codex_command_pins_reproducibility_controls() -> None:
     assert "--dangerously-bypass-approvals-and-sandbox" in command
     assert "< /home/instructions.txt" in command
     assert f"> {CODEX_EVENT_LOG} 2>&1" in command
+
+
+def test_completion_review_prompt_is_concise_and_reports_remaining_time() -> None:
+    prompt = build_completion_review_prompt(31 * 60 + 59)
+
+    assert prompt == (
+        "Review the submission for omitted in-scope experiments or incomplete "
+        "end-to-end paths, and improve it using the remaining 31 minutes. If the "
+        "paper is already fully reproduced, finish without changes."
+    )
+    assert DEFAULT_MIN_REMAINING_SECONDS == 1800
+    assert remaining_budget_seconds(time_limit_seconds=7200, start_time=100, now=3700) == 3600
+
+
+def test_codex_review_resume_uses_exact_thread_and_remaining_budget() -> None:
+    event_log = b'noise\n{"type":"thread.started","thread_id":"thread-123"}\n'
+    assert extract_codex_thread_id(event_log) == "thread-123"
+
+    command = build_codex_resume_command(
+        thread_id="thread-123",
+        prompt=build_completion_review_prompt(3600),
+        model="gpt-5.6-sol",
+        reasoning_effort="high",
+        reasoning_summary="detailed",
+        time_limit=3600,
+    )
+
+    tokens = shlex.split(command)
+    assert "resume" in tokens
+    assert "thread-123" in tokens
+    assert "--ephemeral" not in tokens
+    assert "3600s" in tokens
+    assert "60 minutes" in command
 
 
 @pytest.mark.asyncio
@@ -460,6 +509,54 @@ async def test_codex_solver_uploads_final_submission_checkpoint(
     assert len(stub_heavy_uploads) == 1
     assert stub_heavy_uploads[0]["run_id"] == task.run_id
     assert stub_heavy_uploads[0]["runtime"] == pytest.approx(output.runtime_in_seconds)
+
+
+@pytest.mark.asyncio
+async def test_codex_solver_performs_one_review_with_remaining_original_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stub_heavy_uploads: list[dict[str, object]],
+) -> None:
+    task = make_task(tmp_path)
+    computer = FakeComputer(
+        event_log=b'{"type":"thread.started","thread_id":"thread-123"}\n',
+    )
+    monkeypatch.setattr(codex_solver_module, "remaining_budget_seconds", lambda **_: 3600)
+    solver = CodexSolver(time_limit=7200, completion_review=True)
+
+    output = await solver._run_agent(computer, task)
+
+    assert output.error_msg is None
+    agent_commands = [command for command in computer.commands if "codex exec" in command]
+    assert len(agent_commands) == 2
+    assert "--ephemeral" not in agent_commands[0]
+    assert "resume" in shlex.split(agent_commands[1])
+    assert "thread-123" in shlex.split(agent_commands[1])
+    assert len(stub_heavy_uploads) == 2
+    completion = json.loads((Path(task.run_dir) / "completion-review.json").read_text())
+    assert completion["performed"] is True
+    assert completion["remaining_seconds_at_start"] == 3600
+    assert "review_seconds" not in completion
+    assert "environment_variant" not in completion
+
+
+@pytest.mark.asyncio
+async def test_codex_solver_skips_review_below_thirty_minutes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = make_task(tmp_path)
+    computer = FakeComputer(
+        event_log=b'{"type":"thread.started","thread_id":"thread-123"}\n',
+    )
+    monkeypatch.setattr(codex_solver_module, "remaining_budget_seconds", lambda **_: 1799)
+
+    await CodexSolver(time_limit=7200, completion_review=True)._run_agent(computer, task)
+
+    agent_commands = [command for command in computer.commands if "codex exec" in command]
+    assert len(agent_commands) == 1
+    completion = json.loads((Path(task.run_dir) / "completion-review.json").read_text())
+    assert completion["performed"] is False
+    assert completion["skip_reason"] == "insufficient-original-budget"
 
 
 @pytest.mark.asyncio

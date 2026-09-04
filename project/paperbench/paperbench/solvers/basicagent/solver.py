@@ -46,6 +46,13 @@ from paperbench.solvers.basicagent.utils import (
     optionally_upload_heavy_logs,
     prune_messages,
 )
+from paperbench.solvers.completion_review import (
+    DEFAULT_MIN_REMAINING_SECONDS,
+    build_completion_review_prompt,
+    remaining_budget_seconds,
+    snapshot_initial_submission,
+    write_completion_review_metadata,
+)
 from paperbench.solvers.upload import (
     start_periodic_light_log_upload,
     upload_heavy_logs,
@@ -75,6 +82,14 @@ class BasicAgentSolver(BasePBSolver):
         doc="If True, don't count API retrying time towards time limit",
     )
     iterative_agent: bool = chz.field(default=False)
+    completion_review: bool = chz.field(
+        default=False,
+        doc="Continue once after the first Submit call to review the submission",
+    )
+    completion_review_min_remaining_seconds: int = chz.field(
+        default=DEFAULT_MIN_REMAINING_SECONDS,
+        doc="Minimum original rollout budget required before starting the review",
+    )
 
     upload_interval_messages: int | None = chz.field(default=None)
     upload_interval_seconds: int | None = chz.field(default=1800)
@@ -123,6 +138,7 @@ class BasicAgentSolver(BasePBSolver):
         num_steps = 0
         total_retry_time = 0.0
         last_time_uploaded = time.time()
+        review_performed = False
 
         upload_task = None
         try:
@@ -174,6 +190,78 @@ class BasicAgentSolver(BasePBSolver):
                     for tool_call in tool_calls:
                         handled = await handle_tool_call(tool_call, tools, task, computer)
                         if handled is None:  # signal that submit was called; exit.
+                            if self.completion_review and not review_performed:
+                                if self.time_limit is None:
+                                    raise ValueError(
+                                        "completion_review requires a finite time_limit"
+                                    )
+                                remaining_seconds = remaining_budget_seconds(
+                                    time_limit_seconds=self.time_limit,
+                                    start_time=start_time,
+                                    now=time.time(),
+                                )
+                                if (
+                                    remaining_seconds
+                                    >= self.completion_review_min_remaining_seconds
+                                ):
+                                    await upload_heavy_logs(
+                                        computer=computer,
+                                        agent_start_time=int(start_time),
+                                        agent_dir_config=AGENT_DIR_CONFIG,
+                                        run_dir=task.run_dir,
+                                        run_group_id=task.run_group_id,
+                                        runs_dir=task.runs_dir,
+                                        run_id=task.run_id,
+                                        num_messages=num_steps,
+                                        runtime=time.time() - start_time,
+                                    )
+                                    prompt = build_completion_review_prompt(remaining_seconds)
+                                    messages.append(
+                                        {
+                                            "role": "tool",
+                                            "content": "Completion recorded; continue with the review.",
+                                            "tool_call_id": tool_call.call_id,
+                                        }
+                                    )
+                                    messages.append({"role": "user", "content": prompt})
+                                    review_performed = True
+                                    write_completion_review_metadata(
+                                        task.run_dir,
+                                        {
+                                            "enabled": True,
+                                            "performed": True,
+                                            "minimum_remaining_seconds": self.completion_review_min_remaining_seconds,
+                                            "remaining_seconds_at_start": remaining_seconds,
+                                            "started_at": time.time(),
+                                            "initial_submission": snapshot_initial_submission(
+                                                task.run_dir
+                                            ),
+                                            "prompt": prompt,
+                                        },
+                                    )
+                                    break
+                                write_completion_review_metadata(
+                                    task.run_dir,
+                                    {
+                                        "enabled": True,
+                                        "performed": False,
+                                        "minimum_remaining_seconds": self.completion_review_min_remaining_seconds,
+                                        "remaining_seconds_at_decision": remaining_seconds,
+                                        "skip_reason": "insufficient-original-budget",
+                                        "initial_submission": None,
+                                    },
+                                )
+                            elif review_performed:
+                                write_completion_review_metadata(
+                                    task.run_dir,
+                                    {
+                                        "enabled": True,
+                                        "performed": True,
+                                        "minimum_remaining_seconds": self.completion_review_min_remaining_seconds,
+                                        "finished_at": time.time(),
+                                        "completion_reason": "submit",
+                                    },
+                                )
                             return num_steps
                         messages.append(handled)
                 else:
