@@ -153,9 +153,10 @@ async def test_non_rubric_mode_does_not_expose_evaluation_files(
         "visible": False,
         "mode": None,
         "rubric_container_path": None,
-        "rubric_sha256": None,
-        "criteria_container_path": None,
-        "criterion_count": 0,
+            "rubric_sha256": None,
+            "criteria_container_path": None,
+            "criteria_sha256": None,
+            "criterion_count": 0,
         "judge_addendum_container_path": None,
         "judge_addendum_sha256": None,
     }
@@ -230,6 +231,7 @@ async def test_rubric_criteria_mode_exposes_only_verbatim_flat_leaf_text(
     metadata = tasks[0].evaluation_specification_metadata()
     assert metadata["mode"] == "rubric-criteria"
     assert metadata["criterion_count"] == len(expected)
+    assert metadata["criteria_sha256"]
     assert metadata["rubric_container_path"] is None
     assert metadata["judge_addendum_container_path"] is None
     assert metadata["criteria_container_path"] == RUBRIC_CRITERIA_CONTAINER_PATH

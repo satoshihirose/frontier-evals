@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "papers": {
+    "adaptive-pruning": {
+      "rubric_sha256": "5dadc6dd588a3843ca106364ba6412688dcbb460d06aaca6a90b78d86fedbbaa",
+      "rubric_criteria_sha256": "5be1014a2252b7afbe764dd21dec4cba9be6277fbc12623fb97f9c8561d860a9",
+      "criterion_count": 123
+    },
+    "all-in-one": {
+      "rubric_sha256": "eb125d701612d2e117dd2880afe885f308412dcddece640b05c22c658def485c",
+      "rubric_criteria_sha256": "2112e248e4ecb0bbe0180a78dc2268feeb549409da2e85061d9297a6efbce0e2",
+      "criterion_count": 174
+    },
+    "bam": {
+      "rubric_sha256": "033abb959c3c85a1b1cc9575c5d7046b92eefff08213d0d8e9891ae9ab591786",
+      "rubric_criteria_sha256": "41f8e8050daf6eaec02aeb62e2a3a4a8a195fc08e978548f547399e141dec031",
+      "criterion_count": 789
+    },
+    "bbox": {
+      "rubric_sha256": "6db48c5ade6dd5b0e5189c525692b9ca0492347d314106e6c3d5ee4472756113",
+      "rubric_criteria_sha256": "25258307a77b6b556b53276ad4a9060b2ce411bab002577386f543009fa1192d",
+      "criterion_count": 279
+    },
+    "bridging-data-gaps": {
+      "rubric_sha256": "bb2f71dde7455a9ebf4966d3fd9ffab9de3aa6d5e22fbb06cba5de04d773aff1",
+      "rubric_criteria_sha256": "8ec9a32885e414a7e1cee96d8b1f1da833005acededaa140c8f3706ae563452d",
+      "criterion_count": 172
+    },
+    "fre": {
+      "rubric_sha256": "49a735252f2fb27eebaca1dc8c48312e7ca6b9f15ae1c439242d6c05775b4c96",
+      "rubric_criteria_sha256": "103feb52a00c857e19d6146fe7d0c181f52e187bff15c43ed31ec0fc74c6c4cd",
+      "criterion_count": 437
+    },
+    "ftrl": {
+      "rubric_sha256": "1480740ec2ff1bf411b96237ef6f67a6c3331d0055a57913c5fe504ff4c3b495",
+      "rubric_criteria_sha256": "ddf48596a9d0e79eb7bd49c76cd359efb2d1a82266193f613f9b3b4495779ac8",
+      "criterion_count": 178
+    },
+    "lbcs": {
+      "rubric_sha256": "beeb8b5ededc23e59a0c3dd5f23947915de3bbf690b69c75f29c9eaf230f22b6",
+      "rubric_criteria_sha256": "e562d74e2823084511094883a88485b9806562141ef77811b85c0f0117bb417a",
+      "criterion_count": 916
+    },
+    "lca-on-the-line": {
+      "rubric_sha256": "edc1d72f1af850a2d30e31e0d32b5b69a5b897dc3ff4d6c714b0d5f52705b0f4",
+      "rubric_criteria_sha256": "4845d7f33e6aa4920a13f105ee395bf89b72a93decce128ca0807d384498a6bd",
+      "criterion_count": 819
+    },
+    "mechanistic-understanding": {
+      "rubric_sha256": "8985de861b4462255b1ca83aac18f9edacac41416ab72b86b3a33ba28b261a9e",
+      "rubric_criteria_sha256": "2cd23c5b218090228f28c36f8de18603a953994ad03811dc40bf04d2c418ea6c",
+      "criterion_count": 96
+    },
+    "pinn": {
+      "rubric_sha256": "aa5a270d76778bdc7cce1503ff5ed525aeefe3a9c30a44f65b767bfb2ac6262b",
+      "rubric_criteria_sha256": "1b72a4f829895345d734658efc9d225eae10c67d67ff5d468cbec36449015d94",
+      "criterion_count": 1963
+    },
+    "rice": {
+      "rubric_sha256": "53ed8933515fcdeeadd05a7568ff2da8afe86682a33e8537caf1a873bfe9922e",
+      "rubric_criteria_sha256": "cfb81e9e115f38cf4b7bec983f3384932516fa654eca077a54098c9218fde9aa",
+      "criterion_count": 361
+    },
+    "robust-clip": {
+      "rubric_sha256": "09758578fcf8754315d46866ea33cc52f4332f6df3f16327b832933673fdec1b",
+      "rubric_criteria_sha256": "71f792e2079e8530e7a72988be5f0ec6f6f926cd63d597cf6deb1b4f46a26553",
+      "criterion_count": 106
+    },
+    "sample-specific-masks": {
+      "rubric_sha256": "66bb2e20437ed6afaa558b5a1115be9378c90f5b1c5c026e15b4012fdac9658b",
+      "rubric_criteria_sha256": "af34e19df7909c0ddafb9e10926669ad776817bd32d0b5315c779e5ba5fbd6ac",
+      "criterion_count": 331
+    },
+    "sapg": {
+      "rubric_sha256": "c885f2a26db4cf814d807432f84cff1b3972083be9959cc486f8c2e4c9caf0c5",
+      "rubric_criteria_sha256": "96de113a94d46929b622e9b6720089ba889fd3ce53b1b5405f06146b8f520c4b",
+      "criterion_count": 206
+    },
+    "self-composing-policies": {
+      "rubric_sha256": "5325cf6096ba080a5d18fef7b0cc5b3fc7a26258addd776026874ab0c2f037de",
+      "rubric_criteria_sha256": "a92dac51b58c6f889f3aa09f7d4d00eff4470e072ddcee974442aad2f600b878",
+      "criterion_count": 275
+    },
+    "self-expansion": {
+      "rubric_sha256": "11aa33097f9b7dd6aa4660bbae6869298a3cd061b6f05328905504364af238ab",
+      "rubric_criteria_sha256": "4ffa9b9125784b3ff65799d43f695d270205f107b398b98ad63fb637d094a8e1",
+      "criterion_count": 253
+    },
+    "semantic-self-consistency": {
+      "rubric_sha256": "d3fadf651538936b86cef230bcf842634150f4cef6985aa19611346238506915",
+      "rubric_criteria_sha256": "d9beb91f97a801c448364e8985d4fc9672778971a4ab611ba6453fc1b446031c",
+      "criterion_count": 77
+    },
+    "sequential-neural-score-estimation": {
+      "rubric_sha256": "1b26efde7b28fc5f7290720b4f05d0ed6a232bdf79ce545c4999f3a71f2233fb",
+      "rubric_criteria_sha256": "2e7ff4037e2f293218f863362965a07e20ca382cf317335f33fe4c4731ef8e06",
+      "criterion_count": 92
+    },
+    "stay-on-topic-with-classifier-free-guidance": {
+      "rubric_sha256": "153a9b1655eb1d97ee21af1f1ed2374f77b1afa8091b5a635acdfc46222f1550",
+      "rubric_criteria_sha256": "de09192ff3ef0199a0ef7140fd4bfe3c16b2b706b14e71de02cd9cb97848f0b8",
+      "criterion_count": 121
+    },
+    "stochastic-interpolants": {
+      "rubric_sha256": "f1a4d5d59d8a8eb5fe38ac0df32b2b55351e26ea281f465ebcedd4f53544c97d",
+      "rubric_criteria_sha256": "46dc6c2e28c0b376d5b42f9d6c4c2f2e2c1bd072922c5133272ad3115369435f",
+      "criterion_count": 69
+    },
+    "test-time-model-adaptation": {
+      "rubric_sha256": "7e18699116360b9dc2a0bd133e6ef9f45446c0515eeb0b08b3cf4b438daa9a98",
+      "rubric_criteria_sha256": "cc03d43b70b3f6519af6d6d21d732f35343a73c0c45781eb2bcc1288ab770ad5",
+      "criterion_count": 163
+    },
+    "what-will-my-model-forget": {
+      "rubric_sha256": "050d0bfe70c2a8c78bbee6dd42b259d21b4460137defde482b48a33ac2aefc31",
+      "rubric_criteria_sha256": "79766bdda8330b9320ac3aa770498b66444d4b2089e6db9662c26d7b2a6b911f",
+      "criterion_count": 921
+    }
+  }
+}

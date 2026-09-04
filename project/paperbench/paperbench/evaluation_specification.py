@@ -1,4 +1,7 @@
+import hashlib
 import json
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from paperbench.constants import WORKSPACE_BASE
@@ -6,6 +9,8 @@ from paperbench.constants import WORKSPACE_BASE
 RUBRIC_CONTAINER_PATH = f"{WORKSPACE_BASE}/paper/rubric.json"
 JUDGE_ADDENDUM_CONTAINER_PATH = f"{WORKSPACE_BASE}/paper/judge.addendum.md"
 RUBRIC_CRITERIA_CONTAINER_PATH = f"{WORKSPACE_BASE}/paper/rubric_criteria.json"
+RUBRIC_CRITERIA_ARTIFACT_DIRNAME = "rubric-criteria"
+RUBRIC_CRITERIA_MANIFEST_FILENAME = "manifest.json"
 
 RUBRIC_VISIBLE_INSTRUCTION = """## Additional evaluation specification
 
@@ -55,6 +60,59 @@ def serialize_rubric_criteria(rubric_content: bytes) -> bytes:
         raise ValueError("Rubric root must be an object")
     criteria = flatten_rubric_criteria(rubric)
     return (json.dumps(criteria, ensure_ascii=False, indent=2) + "\n").encode()
+
+
+@dataclass(frozen=True)
+class RubricCriteriaArtifact:
+    content: bytes
+    criteria: tuple[str, ...]
+    sha256: str
+
+
+def _regeneration_error(detail: str) -> ValueError:
+    return ValueError(
+        f"{detail}; regenerate all rubric criteria with "
+        "`python -m paperbench.scripts.generate_rubric_criteria`"
+    )
+
+
+def load_rubric_criteria_artifact(
+    *, paper_id: str, rubric_path: Path
+) -> RubricCriteriaArtifact:
+    """Load a checked-in criteria artifact only when it matches its source rubric."""
+    artifact_dir = rubric_path.parent.parent.parent / RUBRIC_CRITERIA_ARTIFACT_DIRNAME
+    criteria_path = artifact_dir / f"{paper_id}.json"
+    manifest_path = artifact_dir / RUBRIC_CRITERIA_MANIFEST_FILENAME
+    try:
+        manifest = json.loads(manifest_path.read_text())
+        entry = manifest["papers"][paper_id]
+        content = criteria_path.read_bytes()
+    except (FileNotFoundError, KeyError, json.JSONDecodeError, TypeError) as error:
+        raise _regeneration_error(f"Missing or invalid criteria artifact for {paper_id}") from error
+
+    rubric_sha256 = hashlib.sha256(rubric_path.read_bytes()).hexdigest()
+    artifact_sha256 = hashlib.sha256(content).hexdigest()
+    if entry.get("rubric_sha256") != rubric_sha256:
+        raise _regeneration_error(f"Source rubric changed for {paper_id}")
+    if entry.get("rubric_criteria_sha256") != artifact_sha256:
+        raise _regeneration_error(f"Criteria artifact changed for {paper_id}")
+
+    try:
+        decoded = json.loads(content)
+    except json.JSONDecodeError as error:
+        raise _regeneration_error(f"Criteria artifact is not valid JSON for {paper_id}") from error
+    if not isinstance(decoded, list) or not decoded or not all(
+        isinstance(criterion, str) and criterion for criterion in decoded
+    ):
+        raise _regeneration_error(f"Criteria artifact has invalid entries for {paper_id}")
+    if entry.get("criterion_count") != len(decoded):
+        raise _regeneration_error(f"Criteria count does not match for {paper_id}")
+
+    return RubricCriteriaArtifact(
+        content=content,
+        criteria=tuple(decoded),
+        sha256=artifact_sha256,
+    )
 
 
 def add_evaluation_specification_instruction(instructions: str, *, mode: str) -> str:

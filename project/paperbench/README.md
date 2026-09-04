@@ -278,6 +278,22 @@ PaperBench also supports `paperbench.requirements_mode=rubric-criteria`. This up
 copied verbatim. Weights, hierarchy, IDs, `judge.addendum.md`, and grader-only fields are not
 included. The mode is distinct from `rubric-visible`, which exposes the raw evaluation files.
 
+The criteria files are pre-generated for every registered paper under
+`data/rubric-criteria/`; task setup verifies the source-rubric and artifact hashes recorded in
+`manifest.json` before uploading one file. Regenerate the complete set after changing any
+rubric, then verify that no generated file is missing or stale:
+
+```bash
+python -m paperbench.scripts.generate_rubric_criteria
+python -m paperbench.scripts.generate_rubric_criteria --check
+```
+
+Generation first validates every source rubric and only then replaces the generated set. A
+source error therefore cannot partially update otherwise valid artifacts; after correcting the
+source, rerunning the command rebuilds all papers. The registry currently contains 23 papers:
+the benchmark's `all` evaluation split contains 20, while the other 3 are development papers in
+the `dev` split.
+
 #### Supplying reproduction Requirements
 
 PaperBench can optionally provide a generated Requirements CSV as an additional agent input.

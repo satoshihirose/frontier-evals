@@ -36,8 +36,7 @@ from paperbench.evaluation_specification import (
     JUDGE_ADDENDUM_CONTAINER_PATH,
     RUBRIC_CONTAINER_PATH,
     RUBRIC_CRITERIA_CONTAINER_PATH,
-    flatten_rubric_criteria,
-    serialize_rubric_criteria,
+    load_rubric_criteria_artifact,
 )
 from paperbench.grade import JudgeOutput, grade_submission
 from paperbench.monitor.monitor import Monitor, MonitorResult
@@ -123,8 +122,12 @@ class PBTask(ComputerTask):
         if not paper.rubric.is_file():
             raise FileNotFoundError(f"Rubric-visible mode requires a rubric.json: {paper.rubric}")
         if self.requirements_mode == "rubric-criteria":
+            artifact = load_rubric_criteria_artifact(
+                paper_id=paper.id,
+                rubric_path=paper.rubric,
+            )
             await computer.upload(
-                serialize_rubric_criteria(paper.rubric.read_bytes()),
+                artifact.content,
                 RUBRIC_CRITERIA_CONTAINER_PATH,
             )
             await computer.check_shell_command(f"chmod 0444 {RUBRIC_CRITERIA_CONTAINER_PATH}")
@@ -219,10 +222,10 @@ class PBTask(ComputerTask):
             return hashlib.sha256(path.read_bytes()).hexdigest()
 
         rubric_sha256 = digest(paper.rubric)
-        criteria = (
-            flatten_rubric_criteria(json.loads(paper.rubric.read_text()))
+        criteria_artifact = (
+            load_rubric_criteria_artifact(paper_id=paper.id, rubric_path=paper.rubric)
             if self.requirements_mode == "rubric-criteria"
-            else []
+            else None
         )
         judge_addendum_sha256 = (
             digest(paper.judge_addendum) if self.requirements_mode == "rubric-visible" else None
@@ -236,8 +239,11 @@ class PBTask(ComputerTask):
                 else None
             ),
             "rubric_sha256": rubric_sha256,
-            "criteria_container_path": (RUBRIC_CRITERIA_CONTAINER_PATH if criteria else None),
-            "criterion_count": len(criteria),
+            "criteria_container_path": (
+                RUBRIC_CRITERIA_CONTAINER_PATH if criteria_artifact else None
+            ),
+            "criteria_sha256": criteria_artifact.sha256 if criteria_artifact else None,
+            "criterion_count": len(criteria_artifact.criteria) if criteria_artifact else 0,
             "judge_addendum_container_path": (
                 JUDGE_ADDENDUM_CONTAINER_PATH if judge_addendum_sha256 else None
             ),
