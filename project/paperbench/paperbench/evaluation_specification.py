@@ -54,14 +54,6 @@ def flatten_rubric_criteria(rubric: dict[str, Any]) -> list[str]:
     return criteria
 
 
-def serialize_rubric_criteria(rubric_content: bytes) -> bytes:
-    rubric = json.loads(rubric_content)
-    if not isinstance(rubric, dict):
-        raise ValueError("Rubric root must be an object")
-    criteria = flatten_rubric_criteria(rubric)
-    return (json.dumps(criteria, ensure_ascii=False, indent=2) + "\n").encode()
-
-
 @dataclass(frozen=True)
 class RubricCriteriaArtifact:
     content: bytes
