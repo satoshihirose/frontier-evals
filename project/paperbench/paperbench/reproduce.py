@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -23,6 +24,31 @@ from paperbench.nano.structs import PBRuntimeConfig, ReproductionMetadata, Repro
 from paperbench.utils import get_agents_env_vars
 
 logger = structlog.stdlib.get_logger(component=__name__)
+
+
+def _materialize_canonical_submission(source: str, destination: str) -> str:
+    """Expose a selected local attempt without duplicating its archive bytes.
+
+    Reproduction artifacts can also live on blob-backed paths, and local source and
+    destination paths may unexpectedly cross filesystems. In those cases, retain the
+    existing blobfile copy behavior.
+    """
+    if source == destination:
+        return "existing"
+    temporary_link: Path | None = None
+    if "://" not in source and "://" not in destination:
+        destination_path = Path(destination)
+        temporary_link = destination_path.with_name(
+            f".{destination_path.name}.link-{os.getpid()}-{time.time_ns()}"
+        )
+        try:
+            os.link(source, temporary_link)
+            os.replace(temporary_link, destination_path)
+            return "hardlink"
+        except OSError:
+            temporary_link.unlink(missing_ok=True)
+    bf.copy(source, destination, overwrite=True)
+    return "copy"
 
 
 async def run_reproduce_script(
@@ -363,7 +389,15 @@ async def reproduce_on_computer_with_salvaging(
     if repro_metadata.executed_submission != canonical_submission:
         if repro_metadata.executed_submission is None:
             raise ValueError("Selected reproduction attempt has no executed submission")
-        bf.copy(repro_metadata.executed_submission, canonical_submission, overwrite=True)
+        materialization_method = _materialize_canonical_submission(
+            repro_metadata.executed_submission,
+            canonical_submission,
+        )
+        ctx_logger.info(
+            "Selected reproduction attempt exposed at canonical path",
+            materialization_method=materialization_method,
+            selected_attempt=selected_index,
+        )
     repro_metadata = replace(repro_metadata, executed_submission=canonical_submission)
     other_attempts = [
         attempt for index, attempt in enumerate(repro_attempts) if index != selected_index

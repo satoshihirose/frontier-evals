@@ -504,8 +504,11 @@ without evidence that an interpreter change would help.
 
 When salvage is enabled, each attempt is retained as
 `submission_executed_attempt_N.tar.gz` with matching metadata. The selected archive is copied to
-the canonical `submission_executed.tar.gz` path consumed by the Judge. Consequently, future
-analysis can select another retained attempt without rerunning the Agent rollout.
+the canonical `submission_executed.tar.gz` path consumed by the Judge. On a local filesystem the
+canonical path is an atomic hardlink to the selected attempt, so retaining both names does not
+duplicate archive bytes. Blob-backed or cross-filesystem paths fall back to copying.
+Consequently, future analysis can select another retained attempt without rerunning the Agent
+rollout.
 
 #### Judge timeout and leaf-level resume
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 from dataclasses import replace
 from pathlib import Path
 
@@ -7,6 +8,47 @@ import pytest
 
 from paperbench import reproduce as reproduce_module
 from paperbench.nano.structs import ReproductionMetadata
+
+
+def test_materialize_canonical_submission_uses_atomic_hardlink(tmp_path: Path) -> None:
+    source = tmp_path / "submission_executed_attempt_1.tar.gz"
+    destination = tmp_path / "submission_executed.tar.gz"
+    source.write_bytes(b"selected-attempt")
+    destination.write_bytes(b"stale-canonical")
+
+    method = reproduce_module._materialize_canonical_submission(
+        str(source), str(destination)
+    )
+
+    assert method == "hardlink"
+    assert destination.read_bytes() == b"selected-attempt"
+    assert source.stat().st_ino == destination.stat().st_ino
+
+
+def test_materialize_canonical_submission_falls_back_to_blob_copy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "submission_executed_attempt_1.tar.gz"
+    destination = tmp_path / "submission_executed.tar.gz"
+    source.write_bytes(b"selected-attempt")
+    copied: list[tuple[str, str, bool]] = []
+
+    def unavailable_link(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.EXDEV, "cross-device link")
+
+    def fake_copy(source_path: str, destination_path: str, *, overwrite: bool) -> None:
+        copied.append((source_path, destination_path, overwrite))
+
+    monkeypatch.setattr(reproduce_module.os, "link", unavailable_link)
+    monkeypatch.setattr(reproduce_module.bf, "copy", fake_copy)
+
+    method = reproduce_module._materialize_canonical_submission(
+        str(source), str(destination)
+    )
+
+    assert method == "copy"
+    assert copied == [(str(source), str(destination), True)]
 
 
 def _metadata(seconds: float, attempt_index: int) -> ReproductionMetadata:
