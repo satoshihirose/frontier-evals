@@ -58,6 +58,7 @@ class FakeComputer(ComputerInterface):
         version_exit_code: int = 0,
         command_delay: float = 0,
         gpu_name: str | None = None,
+        submission_heads: list[str] | None = None,
     ) -> None:
         self.exit_code = exit_code
         self.event_log = event_log
@@ -66,6 +67,7 @@ class FakeComputer(ComputerInterface):
         self.version_exit_code = version_exit_code
         self.command_delay = command_delay
         self.gpu_name = gpu_name
+        self.submission_heads = list(submission_heads or [])
         self.commands: list[str] = []
         self.uploads: dict[str, bytes] = {}
         self.download_count = 0
@@ -101,6 +103,12 @@ class FakeComputer(ComputerInterface):
         if cmd == "nvidia-smi --query-gpu=name --format=csv,noheader":
             output = f"{self.gpu_name}\n".encode() if self.gpu_name else b""
             return ExecutionResult(output=output, exit_code=0 if self.gpu_name else 1)
+        if cmd == "git -C /home/submission rev-parse HEAD":
+            if not self.submission_heads:
+                return ExecutionResult(output=b"", exit_code=1)
+            return ExecutionResult(
+                output=(self.submission_heads.pop(0) + "\n").encode(), exit_code=0
+            )
         await asyncio.sleep(self.command_delay)
         return ExecutionResult(output=b"", exit_code=self.exit_code)
 
@@ -551,6 +559,35 @@ async def test_codex_solver_repeats_review_while_at_least_one_hour_remains(
     assert completion["completion_reason"] == "insufficient-original-budget"
     assert "review_seconds" not in completion
     assert "environment_variant" not in completion
+
+
+@pytest.mark.asyncio
+async def test_codex_solver_stops_after_two_quick_unchanged_reviews(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = make_task(tmp_path)
+    computer = FakeComputer(
+        event_log=b'{"type":"thread.started","thread_id":"thread-123"}\n',
+        submission_heads=["a" * 40] * 4,
+    )
+    remaining = iter([5000, 4900, 4800, 3599])
+    monkeypatch.setattr(
+        codex_solver_module,
+        "remaining_budget_seconds",
+        lambda **_: next(remaining),
+    )
+
+    output = await CodexSolver(time_limit=7200, completion_review=True)._run_agent(computer, task)
+
+    assert output.error_msg is None
+    agent_commands = [command for command in computer.commands if "codex exec" in command]
+    assert len(agent_commands) == 3
+    completion = json.loads((Path(task.run_dir) / "completion-review.json").read_text())
+    assert completion["review_count"] == 2
+    assert completion["completion_reason"] == "consecutive-quick-unchanged"
+    assert completion["consecutive_quick_unchanged"] == 2
+    assert all(item["quick_unchanged"] is True for item in completion["iterations"])
 
 
 @pytest.mark.asyncio

@@ -48,7 +48,11 @@ from paperbench.solvers.basicagent.utils import (
 )
 from paperbench.solvers.completion_review import (
     DEFAULT_MIN_REMAINING_SECONDS,
+    MAX_CONSECUTIVE_QUICK_UNCHANGED,
+    QUICK_UNCHANGED_MAX_SECONDS,
     build_completion_review_prompt,
+    get_submission_git_head,
+    is_quick_unchanged_review,
     remaining_budget_seconds,
     snapshot_initial_submission,
     write_completion_review_metadata,
@@ -141,6 +145,7 @@ class BasicAgentSolver(BasePBSolver):
         review_count = 0
         review_iterations: list[dict[str, object]] = []
         initial_submission: str | None = None
+        consecutive_quick_unchanged = 0
 
         upload_task = None
         try:
@@ -199,8 +204,58 @@ class BasicAgentSolver(BasePBSolver):
                                     )
                                 decision_time = time.time()
                                 if review_iterations:
-                                    review_iterations[-1]["finished_at"] = decision_time
-                                    review_iterations[-1]["completion_reason"] = "submit"
+                                    previous_review = review_iterations[-1]
+                                    head_after = await get_submission_git_head(computer)
+                                    quick_unchanged = is_quick_unchanged_review(
+                                        head_before=previous_review.get("git_head_before")
+                                        if isinstance(previous_review.get("git_head_before"), str)
+                                        else None,
+                                        head_after=head_after,
+                                        started_at=float(previous_review["started_at"]),
+                                        finished_at=decision_time,
+                                    )
+                                    consecutive_quick_unchanged = (
+                                        consecutive_quick_unchanged + 1 if quick_unchanged else 0
+                                    )
+                                    previous_review.update(
+                                        {
+                                            "finished_at": decision_time,
+                                            "completion_reason": "submit",
+                                            "duration_seconds": decision_time
+                                            - float(previous_review["started_at"]),
+                                            "git_head_after": head_after,
+                                            "quick_unchanged": quick_unchanged,
+                                            "consecutive_quick_unchanged": (
+                                                consecutive_quick_unchanged
+                                            ),
+                                        }
+                                    )
+                                    if (
+                                        consecutive_quick_unchanged
+                                        >= MAX_CONSECUTIVE_QUICK_UNCHANGED
+                                    ):
+                                        write_completion_review_metadata(
+                                            task.run_dir,
+                                            {
+                                                "enabled": True,
+                                                "performed": True,
+                                                "minimum_remaining_seconds": self.completion_review_min_remaining_seconds,
+                                                "quick_unchanged_max_seconds": QUICK_UNCHANGED_MAX_SECONDS,
+                                                "max_consecutive_quick_unchanged": MAX_CONSECUTIVE_QUICK_UNCHANGED,
+                                                "remaining_seconds_at_decision": remaining_budget_seconds(
+                                                    time_limit_seconds=self.time_limit,
+                                                    start_time=start_time,
+                                                    now=decision_time,
+                                                ),
+                                                "initial_submission": initial_submission,
+                                                "review_count": review_count,
+                                                "iterations": review_iterations,
+                                                "finished_at": decision_time,
+                                                "completion_reason": "consecutive-quick-unchanged",
+                                                "consecutive_quick_unchanged": consecutive_quick_unchanged,
+                                            },
+                                        )
+                                        return num_steps
                                 remaining_seconds = remaining_budget_seconds(
                                     time_limit_seconds=self.time_limit,
                                     start_time=start_time,
@@ -228,6 +283,7 @@ class BasicAgentSolver(BasePBSolver):
                                     review_prompt = build_completion_review_prompt(
                                         remaining_seconds
                                     )
+                                    head_before = await get_submission_git_head(computer)
                                     messages.append(
                                         {
                                             "role": "tool",
@@ -243,6 +299,7 @@ class BasicAgentSolver(BasePBSolver):
                                             "prompt": review_prompt,
                                             "remaining_seconds_at_start": remaining_seconds,
                                             "started_at": time.time(),
+                                            "git_head_before": head_before,
                                         }
                                     )
                                     write_completion_review_metadata(
@@ -259,6 +316,9 @@ class BasicAgentSolver(BasePBSolver):
                                             "prompt": review_prompt,
                                             "review_count": review_count,
                                             "iterations": review_iterations,
+                                            "quick_unchanged_max_seconds": QUICK_UNCHANGED_MAX_SECONDS,
+                                            "max_consecutive_quick_unchanged": MAX_CONSECUTIVE_QUICK_UNCHANGED,
+                                            "consecutive_quick_unchanged": consecutive_quick_unchanged,
                                         },
                                     )
                                     break

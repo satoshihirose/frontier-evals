@@ -7,9 +7,15 @@ from typing import Any
 
 import blobfile as bf
 
+from nanoeval.solvers.computer_tasks.code_execution_interface import ComputerInterface
+from paperbench.constants import SUBMISSION_DIR
+
 DEFAULT_MIN_REMAINING_SECONDS = 60 * 60
+QUICK_UNCHANGED_MAX_SECONDS = 5 * 60
+MAX_CONSECUTIVE_QUICK_UNCHANGED = 2
 COMPLETION_REVIEW_METADATA = "completion-review.json"
 INITIAL_SUBMISSION_FILENAME = "initial-submission.tar.gz"
+SUBMISSION_GIT_HEAD_COMMAND = f"git -C {SUBMISSION_DIR} rev-parse HEAD"
 
 
 def remaining_budget_seconds(
@@ -27,6 +33,38 @@ def build_completion_review_prompt(remaining_seconds: int) -> str:
         "current task and use the remaining time to improve and verify your submission. "
         "If you determine that the task is already complete, perform any final "
         "verification you consider appropriate and finish."
+    )
+
+
+async def get_submission_git_head(computer: ComputerInterface) -> str | None:
+    """Return the submission HEAD, or None when it cannot be observed safely."""
+    try:
+        result = await computer.send_shell_command(
+            SUBMISSION_GIT_HEAD_COMMAND,
+            idempotent=True,
+        )
+    except Exception:
+        return None
+    if result.exit_code != 0:
+        return None
+    head = result.output.decode(errors="replace").strip()
+    return head if head else None
+
+
+def is_quick_unchanged_review(
+    *,
+    head_before: str | None,
+    head_after: str | None,
+    started_at: int | float,
+    finished_at: int | float,
+) -> bool:
+    """Detect a review that finished quickly without committing a change."""
+    duration_seconds = max(0.0, finished_at - started_at)
+    return (
+        head_before is not None
+        and head_after is not None
+        and head_before == head_after
+        and duration_seconds <= QUICK_UNCHANGED_MAX_SECONDS
     )
 
 

@@ -33,7 +33,11 @@ from paperbench.solvers.basicagent.utils import (
 )
 from paperbench.solvers.completion_review import (
     DEFAULT_MIN_REMAINING_SECONDS,
+    MAX_CONSECUTIVE_QUICK_UNCHANGED,
+    QUICK_UNCHANGED_MAX_SECONDS,
     build_completion_review_prompt,
+    get_submission_git_head,
+    is_quick_unchanged_review,
     remaining_budget_seconds,
     snapshot_initial_submission,
     write_completion_review_metadata,
@@ -536,6 +540,8 @@ class CodexSolver(BasePBSolver):
             "initial_submission": None,
             "review_count": 0,
             "iterations": [],
+            "quick_unchanged_max_seconds": QUICK_UNCHANGED_MAX_SECONDS,
+            "max_consecutive_quick_unchanged": MAX_CONSECUTIVE_QUICK_UNCHANGED,
         }
         if self.completion_review and exit_code == 0:
             remaining_seconds = remaining_budget_seconds(
@@ -563,6 +569,7 @@ class CodexSolver(BasePBSolver):
                     )
                     initial_submission = snapshot_initial_submission(task.run_dir)
                     iterations: list[dict[str, object]] = []
+                    consecutive_quick_unchanged = 0
                     while (
                         exit_code == 0
                         and remaining_seconds >= self.completion_review_min_remaining_seconds
@@ -576,6 +583,7 @@ class CodexSolver(BasePBSolver):
                             reasoning_summary=self.reasoning_summary,
                             time_limit=remaining_seconds,
                         )
+                        head_before = await get_submission_git_head(computer)
                         review_started_at = time.time()
                         try:
                             review_result = await self._execute_with_checkpoints(
@@ -607,6 +615,16 @@ class CodexSolver(BasePBSolver):
                             error_msg = f"Codex completion review failed: {exc}"
                             logger.exception(error_msg)
                         review_finished_at = time.time()
+                        head_after = await get_submission_git_head(computer)
+                        quick_unchanged = is_quick_unchanged_review(
+                            head_before=head_before,
+                            head_after=head_after,
+                            started_at=review_started_at,
+                            finished_at=review_finished_at,
+                        )
+                        consecutive_quick_unchanged = (
+                            consecutive_quick_unchanged + 1 if quick_unchanged else 0
+                        )
                         iterations.append(
                             {
                                 "index": len(iterations) + 1,
@@ -615,6 +633,11 @@ class CodexSolver(BasePBSolver):
                                 "started_at": review_started_at,
                                 "finished_at": review_finished_at,
                                 "exit_code": exit_code,
+                                "duration_seconds": review_finished_at - review_started_at,
+                                "git_head_before": head_before,
+                                "git_head_after": head_after,
+                                "quick_unchanged": quick_unchanged,
+                                "consecutive_quick_unchanged": consecutive_quick_unchanged,
                             }
                         )
                         completion_review_metadata.update(
@@ -631,10 +654,16 @@ class CodexSolver(BasePBSolver):
                                 "initial_submission": initial_submission,
                                 "review_count": len(iterations),
                                 "iterations": iterations,
+                                "consecutive_quick_unchanged": (consecutive_quick_unchanged),
                             }
                         )
                         if exit_code != 0:
                             completion_review_metadata["completion_reason"] = "review-exit-nonzero"
+                            break
+                        if consecutive_quick_unchanged >= MAX_CONSECUTIVE_QUICK_UNCHANGED:
+                            completion_review_metadata["completion_reason"] = (
+                                "consecutive-quick-unchanged"
+                            )
                             break
                         remaining_seconds = remaining_budget_seconds(
                             time_limit_seconds=self.time_limit,
