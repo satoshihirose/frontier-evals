@@ -215,11 +215,12 @@ def test_completion_review_prompt_is_concise_and_reports_remaining_time() -> Non
     prompt = build_completion_review_prompt(31 * 60 + 59)
 
     assert prompt == (
-        "Review the submission for omitted in-scope experiments or incomplete "
-        "end-to-end paths, and improve it using the remaining 31 minutes. If the "
-        "paper is already fully reproduced, finish without changes."
+        "You have 31 minutes remaining. Continue working on the current task and "
+        "use the remaining time to improve and verify your submission. If you "
+        "determine that the task is already complete, perform any final verification "
+        "you consider appropriate and finish."
     )
-    assert DEFAULT_MIN_REMAINING_SECONDS == 1800
+    assert DEFAULT_MIN_REMAINING_SECONDS == 3600
     assert remaining_budget_seconds(time_limit_seconds=7200, start_time=100, now=3700) == 3600
 
 
@@ -512,7 +513,7 @@ async def test_codex_solver_uploads_final_submission_checkpoint(
 
 
 @pytest.mark.asyncio
-async def test_codex_solver_performs_one_review_with_remaining_original_budget(
+async def test_codex_solver_repeats_review_while_at_least_one_hour_remains(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     stub_heavy_uploads: list[dict[str, object]],
@@ -521,34 +522,46 @@ async def test_codex_solver_performs_one_review_with_remaining_original_budget(
     computer = FakeComputer(
         event_log=b'{"type":"thread.started","thread_id":"thread-123"}\n',
     )
-    monkeypatch.setattr(codex_solver_module, "remaining_budget_seconds", lambda **_: 3600)
+    remaining = iter([5000, 4000, 3599])
+    monkeypatch.setattr(
+        codex_solver_module,
+        "remaining_budget_seconds",
+        lambda **_: next(remaining),
+    )
     solver = CodexSolver(time_limit=7200, completion_review=True)
 
     output = await solver._run_agent(computer, task)
 
     assert output.error_msg is None
     agent_commands = [command for command in computer.commands if "codex exec" in command]
-    assert len(agent_commands) == 2
+    assert len(agent_commands) == 3
     assert "--ephemeral" not in agent_commands[0]
     assert "resume" in shlex.split(agent_commands[1])
     assert "thread-123" in shlex.split(agent_commands[1])
+    assert "resume" in shlex.split(agent_commands[2])
     assert len(stub_heavy_uploads) == 2
     completion = json.loads((Path(task.run_dir) / "completion-review.json").read_text())
     assert completion["performed"] is True
-    assert completion["remaining_seconds_at_start"] == 3600
+    assert completion["review_count"] == 2
+    assert completion["remaining_seconds_at_start"] == 5000
+    assert [item["remaining_seconds_at_start"] for item in completion["iterations"]] == [
+        5000,
+        4000,
+    ]
+    assert completion["completion_reason"] == "insufficient-original-budget"
     assert "review_seconds" not in completion
     assert "environment_variant" not in completion
 
 
 @pytest.mark.asyncio
-async def test_codex_solver_skips_review_below_thirty_minutes(
+async def test_codex_solver_skips_review_below_one_hour(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     task = make_task(tmp_path)
     computer = FakeComputer(
         event_log=b'{"type":"thread.started","thread_id":"thread-123"}\n',
     )
-    monkeypatch.setattr(codex_solver_module, "remaining_budget_seconds", lambda **_: 1799)
+    monkeypatch.setattr(codex_solver_module, "remaining_budget_seconds", lambda **_: 3599)
 
     await CodexSolver(time_limit=7200, completion_review=True)._run_agent(computer, task)
 

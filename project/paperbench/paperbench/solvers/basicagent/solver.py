@@ -84,7 +84,7 @@ class BasicAgentSolver(BasePBSolver):
     iterative_agent: bool = chz.field(default=False)
     completion_review: bool = chz.field(
         default=False,
-        doc="Continue once after the first Submit call to review the submission",
+        doc="Continue after Submit calls while enough original budget remains",
     )
     completion_review_min_remaining_seconds: int = chz.field(
         default=DEFAULT_MIN_REMAINING_SECONDS,
@@ -138,7 +138,9 @@ class BasicAgentSolver(BasePBSolver):
         num_steps = 0
         total_retry_time = 0.0
         last_time_uploaded = time.time()
-        review_performed = False
+        review_count = 0
+        review_iterations: list[dict[str, object]] = []
+        initial_submission: str | None = None
 
         upload_task = None
         try:
@@ -189,16 +191,20 @@ class BasicAgentSolver(BasePBSolver):
                 if tool_calls:
                     for tool_call in tool_calls:
                         handled = await handle_tool_call(tool_call, tools, task, computer)
-                        if handled is None:  # signal that submit was called; exit.
-                            if self.completion_review and not review_performed:
+                        if handled is None:  # signal that submit was called; exit or review.
+                            if self.completion_review:
                                 if self.time_limit is None:
                                     raise ValueError(
                                         "completion_review requires a finite time_limit"
                                     )
+                                decision_time = time.time()
+                                if review_iterations:
+                                    review_iterations[-1]["finished_at"] = decision_time
+                                    review_iterations[-1]["completion_reason"] = "submit"
                                 remaining_seconds = remaining_budget_seconds(
                                     time_limit_seconds=self.time_limit,
                                     start_time=start_time,
-                                    now=time.time(),
+                                    now=decision_time,
                                 )
                                 if (
                                     remaining_seconds
@@ -215,7 +221,13 @@ class BasicAgentSolver(BasePBSolver):
                                         num_messages=num_steps,
                                         runtime=time.time() - start_time,
                                     )
-                                    prompt = build_completion_review_prompt(remaining_seconds)
+                                    if initial_submission is None:
+                                        initial_submission = snapshot_initial_submission(
+                                            task.run_dir
+                                        )
+                                    review_prompt = build_completion_review_prompt(
+                                        remaining_seconds
+                                    )
                                     messages.append(
                                         {
                                             "role": "tool",
@@ -223,44 +235,56 @@ class BasicAgentSolver(BasePBSolver):
                                             "tool_call_id": tool_call.call_id,
                                         }
                                     )
-                                    messages.append({"role": "user", "content": prompt})
-                                    review_performed = True
+                                    messages.append({"role": "user", "content": review_prompt})
+                                    review_count += 1
+                                    review_iterations.append(
+                                        {
+                                            "index": review_count,
+                                            "prompt": review_prompt,
+                                            "remaining_seconds_at_start": remaining_seconds,
+                                            "started_at": time.time(),
+                                        }
+                                    )
                                     write_completion_review_metadata(
                                         task.run_dir,
                                         {
                                             "enabled": True,
                                             "performed": True,
                                             "minimum_remaining_seconds": self.completion_review_min_remaining_seconds,
-                                            "remaining_seconds_at_start": remaining_seconds,
-                                            "started_at": time.time(),
-                                            "initial_submission": snapshot_initial_submission(
-                                                task.run_dir
-                                            ),
-                                            "prompt": prompt,
+                                            "remaining_seconds_at_start": review_iterations[0][
+                                                "remaining_seconds_at_start"
+                                            ],
+                                            "started_at": review_iterations[0]["started_at"],
+                                            "initial_submission": initial_submission,
+                                            "prompt": review_prompt,
+                                            "review_count": review_count,
+                                            "iterations": review_iterations,
                                         },
                                     )
                                     break
+                                completion_metadata: dict[str, object] = {
+                                    "enabled": True,
+                                    "performed": review_count > 0,
+                                    "minimum_remaining_seconds": self.completion_review_min_remaining_seconds,
+                                    "remaining_seconds_at_decision": remaining_seconds,
+                                    "initial_submission": initial_submission,
+                                    "review_count": review_count,
+                                    "iterations": review_iterations,
+                                }
+                                if review_count:
+                                    completion_metadata.update(
+                                        {
+                                            "finished_at": decision_time,
+                                            "completion_reason": ("insufficient-original-budget"),
+                                        }
+                                    )
+                                else:
+                                    completion_metadata["skip_reason"] = (
+                                        "insufficient-original-budget"
+                                    )
                                 write_completion_review_metadata(
                                     task.run_dir,
-                                    {
-                                        "enabled": True,
-                                        "performed": False,
-                                        "minimum_remaining_seconds": self.completion_review_min_remaining_seconds,
-                                        "remaining_seconds_at_decision": remaining_seconds,
-                                        "skip_reason": "insufficient-original-budget",
-                                        "initial_submission": None,
-                                    },
-                                )
-                            elif review_performed:
-                                write_completion_review_metadata(
-                                    task.run_dir,
-                                    {
-                                        "enabled": True,
-                                        "performed": True,
-                                        "minimum_remaining_seconds": self.completion_review_min_remaining_seconds,
-                                        "finished_at": time.time(),
-                                        "completion_reason": "submit",
-                                    },
+                                    completion_metadata,
                                 )
                             return num_steps
                         messages.append(handled)

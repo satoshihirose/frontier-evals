@@ -31,6 +31,7 @@ from paperbench.monitor.monitor import BasicMonitor, Monitor
 from paperbench.nano.structs import (
     JudgeConfig,
     PaperBenchGrade,
+    PaperBenchResult,
     ReproductionConfig,
 )
 from paperbench.nano.task import PBTask
@@ -57,6 +58,38 @@ GRADER_OPENAI_API_KEY = os.getenv("GRADER_OPENAI_API_KEY") or os.getenv("OPENAI_
 
 logger = structlog.stdlib.get_logger(component=__name__)
 PAPER_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+
+def build_run_health(
+    results: Sequence[PaperBenchResult], *, grading_enabled: bool
+) -> dict[str, int | str | None]:
+    """Summarize failures only when PaperBench owns the full evaluation.
+
+    ReproGapBench recovery runs deliberately set ``judge.grade=False`` and use
+    their queue stage result as the authoritative reproduction outcome.  The
+    nanoeval summary may omit those ungraded results, so interpreting missing
+    metadata as a reproduction failure produces a misleading failure count.
+    """
+    health: dict[str, int | str | None] = {
+        "mode": "full_evaluation" if grading_enabled else "reproduction_only",
+        "n_rollouts_failed": len(
+            [result for result in results if not result.agent_output or not result.submission_exists]
+        ),
+        "n_reproductions_failed": None,
+        "n_gradings_failed": None,
+    }
+    if grading_enabled:
+        health["n_reproductions_failed"] = len(
+            [result for result in results if not result.reproduction_metadata]
+        )
+        health["n_gradings_failed"] = len(
+            [
+                result
+                for result in results
+                if not result.judge_output or not result.judge_output.success
+            ]
+        )
+    return health
 
 
 def requires_grader_openai_api_key(completer_config: object) -> bool:
@@ -370,17 +403,7 @@ class PaperBench(PythonCodingEval):
 
         # health
         results_clean = [r for r in final_results if not isinstance(r, RolloutSystemError)]
-        run_health = {
-            "n_rollouts_failed": len(
-                [r for r in results_clean if not r.agent_output or not r.submission_exists]
-            ),
-            "n_reproductions_failed": len(
-                [r for r in results_clean if not r.reproduction_metadata]
-            ),
-            "n_gradings_failed": len(
-                [r for r in results_clean if not r.judge_output or not r.judge_output.success]
-            ),
-        }
+        run_health = build_run_health(results_clean, grading_enabled=self.judge.grade)
 
         eval_runs = gather_eval_runs(results_clean, self.n_tries)
         expected_papers = len(self.selected_paper_ids())

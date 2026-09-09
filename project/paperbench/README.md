@@ -266,12 +266,12 @@ runs inside PaperBench, so rollout time, logs, blacklist monitoring, and submiss
 retain their normal benchmark meaning.
 
 For a completion-persistence intervention, both `CodexSolver` and the iterative
-`BasicAgentSolver` accept `completion_review=True`. At the first normal completion, the solver
-preserves `initial-submission.tar.gz` and, when at least 1,800 seconds of the original rollout
-budget remain, continues the same session once using only that remaining budget. The concise
-review instruction reports the remaining minutes and asks the Agent to check for omitted
-in-scope experiments and incomplete end-to-end paths; if the paper is already fully reproduced,
-it may finish without changes. This is opt-in and does not add time beyond the original limit.
+`BasicAgentSolver` and `CodexSolver` accept `completion_review=True`. At the first normal
+completion, the solver preserves `initial-submission.tar.gz`. While at least 3,600 seconds of
+the original rollout budget remain, each subsequent completion resumes the same session with a
+neutral instruction to continue improving and verifying the same task. Once less than one hour
+remains, the solver accepts the current submission. This is opt-in and does not add time beyond
+the original limit.
 
 PaperBench also supports `paperbench.requirements_mode=rubric-criteria`. This uploads
 `/home/paper/rubric_criteria.json`, a flat JSON array of the rubric leaves' `requirements` text

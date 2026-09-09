@@ -7,7 +7,7 @@ from typing import Any
 
 import blobfile as bf
 
-DEFAULT_MIN_REMAINING_SECONDS = 30 * 60
+DEFAULT_MIN_REMAINING_SECONDS = 60 * 60
 COMPLETION_REVIEW_METADATA = "completion-review.json"
 INITIAL_SUBMISSION_FILENAME = "initial-submission.tar.gz"
 
@@ -23,10 +23,10 @@ def build_completion_review_prompt(remaining_seconds: int) -> str:
         raise ValueError("remaining_seconds must be non-negative")
     remaining_minutes = remaining_seconds // 60
     return (
-        "Review the submission for omitted in-scope experiments or incomplete "
-        "end-to-end paths, and improve it using the remaining "
-        f"{remaining_minutes} minutes. If the paper is already fully reproduced, "
-        "finish without changes."
+        f"You have {remaining_minutes} minutes remaining. Continue working on the "
+        "current task and use the remaining time to improve and verify your submission. "
+        "If you determine that the task is already complete, perform any final "
+        "verification you consider appropriate and finish."
     )
 
 

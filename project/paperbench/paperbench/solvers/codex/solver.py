@@ -309,7 +309,7 @@ class CodexSolver(BasePBSolver):
     )
     completion_review: bool = chz.field(
         default=False,
-        doc="Resume a completed rollout once to review its submission",
+        doc="Resume completed rollouts while enough original budget remains",
     )
     completion_review_min_remaining_seconds: int = chz.field(
         default=DEFAULT_MIN_REMAINING_SECONDS,
@@ -534,6 +534,8 @@ class CodexSolver(BasePBSolver):
             "performed": False,
             "minimum_remaining_seconds": self.completion_review_min_remaining_seconds,
             "initial_submission": None,
+            "review_count": 0,
+            "iterations": [],
         }
         if self.completion_review and exit_code == 0:
             remaining_seconds = remaining_budget_seconds(
@@ -560,54 +562,95 @@ class CodexSolver(BasePBSolver):
                         runtime=time.time() - start_time,
                     )
                     initial_submission = snapshot_initial_submission(task.run_dir)
-                    review_prompt = build_completion_review_prompt(remaining_seconds)
-                    review_command = build_codex_resume_command(
-                        thread_id=thread_id,
-                        prompt=review_prompt,
-                        model=self.model,
-                        reasoning_effort=self.reasoning_effort,
-                        reasoning_summary=self.reasoning_summary,
-                        time_limit=remaining_seconds,
-                    )
-                    review_started_at = time.time()
-                    try:
-                        review_result = await self._execute_with_checkpoints(
-                            computer=computer,
-                            task=task,
-                            command=review_command,
-                            start_time=start_time,
+                    iterations: list[dict[str, object]] = []
+                    while (
+                        exit_code == 0
+                        and remaining_seconds >= self.completion_review_min_remaining_seconds
+                    ):
+                        review_prompt = build_completion_review_prompt(remaining_seconds)
+                        review_command = build_codex_resume_command(
+                            thread_id=thread_id,
+                            prompt=review_prompt,
+                            model=self.model,
+                            reasoning_effort=self.reasoning_effort,
+                            reasoning_summary=self.reasoning_summary,
+                            time_limit=remaining_seconds,
                         )
-                        review_log = await self._read_event_log(
-                            computer,
-                            review_result.output,
-                            CODEX_REVIEW_EVENT_LOG,
-                        )
-                        event_log = event_log.rstrip() + b"\n" + review_log
-                        exit_code = review_result.exit_code
-                        if exit_code == 124:
-                            error_msg = (
-                                "Codex completion review exhausted the remaining original budget"
+                        review_started_at = time.time()
+                        try:
+                            review_result = await self._execute_with_checkpoints(
+                                computer=computer,
+                                task=task,
+                                command=review_command,
+                                start_time=start_time,
                             )
-                        elif exit_code != 0:
-                            error_msg = f"Codex completion review exited with status {exit_code}"
-                        else:
-                            error_msg = None
-                    except Exception as exc:
-                        exit_code = 1
-                        error_msg = f"Codex completion review failed: {exc}"
-                        logger.exception(error_msg)
-                    completion_review_metadata.update(
-                        {
-                            "performed": True,
-                            "thread_id": thread_id,
-                            "prompt": review_prompt,
-                            "remaining_seconds_at_start": remaining_seconds,
-                            "started_at": review_started_at,
-                            "finished_at": time.time(),
-                            "exit_code": exit_code,
-                            "initial_submission": initial_submission,
-                        }
-                    )
+                            review_log = await self._read_event_log(
+                                computer,
+                                review_result.output,
+                                CODEX_REVIEW_EVENT_LOG,
+                            )
+                            event_log = event_log.rstrip() + b"\n" + review_log
+                            exit_code = review_result.exit_code
+                            if exit_code == 124:
+                                error_msg = (
+                                    "Codex completion review exhausted the remaining "
+                                    "original budget"
+                                )
+                            elif exit_code != 0:
+                                error_msg = (
+                                    f"Codex completion review exited with status {exit_code}"
+                                )
+                            else:
+                                error_msg = None
+                        except Exception as exc:
+                            exit_code = 1
+                            error_msg = f"Codex completion review failed: {exc}"
+                            logger.exception(error_msg)
+                        review_finished_at = time.time()
+                        iterations.append(
+                            {
+                                "index": len(iterations) + 1,
+                                "prompt": review_prompt,
+                                "remaining_seconds_at_start": remaining_seconds,
+                                "started_at": review_started_at,
+                                "finished_at": review_finished_at,
+                                "exit_code": exit_code,
+                            }
+                        )
+                        completion_review_metadata.update(
+                            {
+                                "performed": True,
+                                "thread_id": thread_id,
+                                "prompt": review_prompt,
+                                "remaining_seconds_at_start": iterations[0][
+                                    "remaining_seconds_at_start"
+                                ],
+                                "started_at": iterations[0]["started_at"],
+                                "finished_at": review_finished_at,
+                                "exit_code": exit_code,
+                                "initial_submission": initial_submission,
+                                "review_count": len(iterations),
+                                "iterations": iterations,
+                            }
+                        )
+                        if exit_code != 0:
+                            completion_review_metadata["completion_reason"] = "review-exit-nonzero"
+                            break
+                        remaining_seconds = remaining_budget_seconds(
+                            time_limit_seconds=self.time_limit,
+                            start_time=start_time,
+                            now=time.time(),
+                        )
+                        completion_review_metadata["remaining_seconds_at_decision"] = (
+                            remaining_seconds
+                        )
+                    if (
+                        exit_code == 0
+                        and remaining_seconds < self.completion_review_min_remaining_seconds
+                    ):
+                        completion_review_metadata["completion_reason"] = (
+                            "insufficient-original-budget"
+                        )
 
         end_time = time.time()
         if self.completion_review:
