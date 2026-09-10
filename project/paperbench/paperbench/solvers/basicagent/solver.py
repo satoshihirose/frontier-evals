@@ -50,7 +50,12 @@ from paperbench.solvers.completion_review import (
     DEFAULT_MIN_REMAINING_SECONDS,
     MAX_CONSECUTIVE_QUICK_UNCHANGED,
     QUICK_UNCHANGED_MAX_SECONDS,
+    CompletionReviewMode,
     build_completion_review_prompt,
+    build_execution_feedback_command,
+    build_execution_feedback_prompt,
+    execution_feedback_paths,
+    execution_feedback_timeout_seconds,
     get_submission_git_head,
     is_quick_unchanged_review,
     remaining_budget_seconds,
@@ -94,6 +99,14 @@ class BasicAgentSolver(BasePBSolver):
         default=DEFAULT_MIN_REMAINING_SECONDS,
         doc="Minimum original rollout budget required before starting the review",
     )
+    completion_review_mode: CompletionReviewMode = chz.field(
+        default="generic",
+        doc="Use a neutral review or first expose a harness-run reproduce.sh log",
+    )
+    execution_feedback_timeout_seconds: int = chz.field(
+        default=60 * 60,
+        doc="Maximum reproduce.sh runtime before each execution-log review",
+    )
 
     upload_interval_messages: int | None = chz.field(default=None)
     upload_interval_seconds: int | None = chz.field(default=1800)
@@ -131,6 +144,10 @@ class BasicAgentSolver(BasePBSolver):
         ctx_logger = logger.bind(
             run_group_id=task.run_group_id, run_id=task.run_id, runs_dir=task.runs_dir
         )
+        if self.completion_review_mode not in {"generic", "execution-log"}:
+            raise ValueError(f"Unsupported completion_review_mode: {self.completion_review_mode}")
+        if self.execution_feedback_timeout_seconds <= 0:
+            raise ValueError("execution_feedback_timeout_seconds must be positive")
 
         tools = self._get_tools()
         self.completer_config.basicagent_tools = tools
@@ -239,6 +256,8 @@ class BasicAgentSolver(BasePBSolver):
                                             {
                                                 "enabled": True,
                                                 "performed": True,
+                                                "mode": self.completion_review_mode,
+                                                "budget_policy": "shared-agent-and-diagnostic-wall-clock",
                                                 "minimum_remaining_seconds": self.completion_review_min_remaining_seconds,
                                                 "quick_unchanged_max_seconds": QUICK_UNCHANGED_MAX_SECONDS,
                                                 "max_consecutive_quick_unchanged": MAX_CONSECUTIVE_QUICK_UNCHANGED,
@@ -280,9 +299,95 @@ class BasicAgentSolver(BasePBSolver):
                                         initial_submission = snapshot_initial_submission(
                                             task.run_dir
                                         )
-                                    review_prompt = build_completion_review_prompt(
-                                        remaining_seconds
-                                    )
+                                    execution_feedback: dict[str, object] | None = None
+                                    if self.completion_review_mode == "execution-log":
+                                        diagnostic_timeout = execution_feedback_timeout_seconds(
+                                            remaining_seconds=remaining_seconds,
+                                            minimum_review_seconds=(
+                                                self.completion_review_min_remaining_seconds
+                                            ),
+                                            maximum_execution_seconds=(
+                                                self.execution_feedback_timeout_seconds
+                                            ),
+                                        )
+                                        if diagnostic_timeout <= 0:
+                                            write_completion_review_metadata(
+                                                task.run_dir,
+                                                {
+                                                    "enabled": True,
+                                                    "performed": review_count > 0,
+                                                    "mode": self.completion_review_mode,
+                                                    "budget_policy": "shared-agent-and-diagnostic-wall-clock",
+                                                    "minimum_remaining_seconds": self.completion_review_min_remaining_seconds,
+                                                    "execution_feedback_timeout_seconds": self.execution_feedback_timeout_seconds,
+                                                    "remaining_seconds_at_decision": remaining_seconds,
+                                                    "initial_submission": initial_submission,
+                                                    "review_count": review_count,
+                                                    "iterations": review_iterations,
+                                                    "completion_reason": "insufficient-budget-for-execution-feedback",
+                                                },
+                                            )
+                                            return num_steps
+                                        feedback_index = review_count + 1
+                                        feedback_log_path, _ = execution_feedback_paths(
+                                            feedback_index
+                                        )
+                                        feedback_started_at = time.time()
+                                        feedback_result = await computer.send_shell_command(
+                                            build_execution_feedback_command(
+                                                iteration=feedback_index,
+                                                timeout_seconds=diagnostic_timeout,
+                                            )
+                                        )
+                                        feedback_finished_at = time.time()
+                                        execution_feedback = {
+                                            "timeout_seconds": diagnostic_timeout,
+                                            "log_path": feedback_log_path,
+                                            "started_at": feedback_started_at,
+                                            "finished_at": feedback_finished_at,
+                                            "duration_seconds": (
+                                                feedback_finished_at - feedback_started_at
+                                            ),
+                                            "exit_code": feedback_result.exit_code,
+                                            "timed_out": feedback_result.exit_code == 124,
+                                            "error": None,
+                                        }
+                                        remaining_seconds = remaining_budget_seconds(
+                                            time_limit_seconds=self.time_limit,
+                                            start_time=start_time,
+                                            now=time.time(),
+                                        )
+                                        if (
+                                            remaining_seconds
+                                            < self.completion_review_min_remaining_seconds
+                                        ):
+                                            write_completion_review_metadata(
+                                                task.run_dir,
+                                                {
+                                                    "enabled": True,
+                                                    "performed": review_count > 0,
+                                                    "mode": self.completion_review_mode,
+                                                    "budget_policy": "shared-agent-and-diagnostic-wall-clock",
+                                                    "minimum_remaining_seconds": self.completion_review_min_remaining_seconds,
+                                                    "execution_feedback_timeout_seconds": self.execution_feedback_timeout_seconds,
+                                                    "remaining_seconds_at_decision": remaining_seconds,
+                                                    "initial_submission": initial_submission,
+                                                    "review_count": review_count,
+                                                    "iterations": review_iterations,
+                                                    "completion_reason": "insufficient-original-budget",
+                                                },
+                                            )
+                                            return num_steps
+                                        review_prompt = build_execution_feedback_prompt(
+                                            remaining_seconds=remaining_seconds,
+                                            log_path=feedback_log_path,
+                                            reproduction_exit_code=(feedback_result.exit_code),
+                                            reproduction_timeout_seconds=(diagnostic_timeout),
+                                        )
+                                    else:
+                                        review_prompt = build_completion_review_prompt(
+                                            remaining_seconds
+                                        )
                                     head_before = await get_submission_git_head(computer)
                                     messages.append(
                                         {
@@ -300,6 +405,11 @@ class BasicAgentSolver(BasePBSolver):
                                             "remaining_seconds_at_start": remaining_seconds,
                                             "started_at": time.time(),
                                             "git_head_before": head_before,
+                                            **(
+                                                {"execution_feedback": (execution_feedback)}
+                                                if execution_feedback is not None
+                                                else {}
+                                            ),
                                         }
                                     )
                                     write_completion_review_metadata(
@@ -307,6 +417,8 @@ class BasicAgentSolver(BasePBSolver):
                                         {
                                             "enabled": True,
                                             "performed": True,
+                                            "mode": self.completion_review_mode,
+                                            "budget_policy": "shared-agent-and-diagnostic-wall-clock",
                                             "minimum_remaining_seconds": self.completion_review_min_remaining_seconds,
                                             "remaining_seconds_at_start": review_iterations[0][
                                                 "remaining_seconds_at_start"
@@ -325,6 +437,8 @@ class BasicAgentSolver(BasePBSolver):
                                 completion_metadata: dict[str, object] = {
                                     "enabled": True,
                                     "performed": review_count > 0,
+                                    "mode": self.completion_review_mode,
+                                    "budget_policy": "shared-agent-and-diagnostic-wall-clock",
                                     "minimum_remaining_seconds": self.completion_review_min_remaining_seconds,
                                     "remaining_seconds_at_decision": remaining_seconds,
                                     "initial_submission": initial_submission,

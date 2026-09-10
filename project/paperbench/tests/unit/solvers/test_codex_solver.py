@@ -27,6 +27,9 @@ from paperbench.solvers.codex.solver import (
     CODEX_AUTH_PATH,
     CODEX_AUTH_STATUS_COMMAND,
     CODEX_EVENT_LOG,
+    CODEX_FORK_CHECKPOINT_CONTAINER_PATH,
+    CODEX_FORK_SESSION_ARCHIVE,
+    CODEX_FORK_SOURCE_ARCHIVE,
     CODEX_HOME,
     CODEX_HOME_PREPARE_COMMAND,
     CODEX_REVIEW_EVENT_LOG,
@@ -35,7 +38,10 @@ from paperbench.solvers.codex.solver import (
     URL_OBSERVATIONS_FILENAME,
     CodexSolver,
     build_codex_command,
+    build_codex_fork_command,
+    build_codex_fork_restore_command,
     build_codex_resume_command,
+    build_codex_session_checkpoint_command,
     build_codex_user_instructions,
     extract_codex_thread_id,
     extract_url_observations,
@@ -43,6 +49,8 @@ from paperbench.solvers.codex.solver import (
 from paperbench.solvers.completion_review import (
     DEFAULT_MIN_REMAINING_SECONDS,
     build_completion_review_prompt,
+    build_execution_feedback_prompt,
+    execution_feedback_timeout_seconds,
     remaining_budget_seconds,
 )
 
@@ -59,6 +67,7 @@ class FakeComputer(ComputerInterface):
         command_delay: float = 0,
         gpu_name: str | None = None,
         submission_heads: list[str] | None = None,
+        fork_checkpoint: bytes = b"fork-checkpoint",
     ) -> None:
         self.exit_code = exit_code
         self.event_log = event_log
@@ -68,6 +77,7 @@ class FakeComputer(ComputerInterface):
         self.command_delay = command_delay
         self.gpu_name = gpu_name
         self.submission_heads = list(submission_heads or [])
+        self.fork_checkpoint = fork_checkpoint
         self.commands: list[str] = []
         self.uploads: dict[str, bytes] = {}
         self.download_count = 0
@@ -82,6 +92,8 @@ class FakeComputer(ComputerInterface):
     async def download(self, file: str) -> bytes:
         if file == CODEX_AUTH_PATH:
             return self.refreshed_auth
+        if file == CODEX_FORK_CHECKPOINT_CONTAINER_PATH:
+            return self.fork_checkpoint
         if file == CODEX_REVIEW_EVENT_LOG:
             return self.review_event_log
         assert file == CODEX_EVENT_LOG
@@ -223,13 +235,58 @@ def test_completion_review_prompt_is_concise_and_reports_remaining_time() -> Non
     prompt = build_completion_review_prompt(31 * 60 + 59)
 
     assert prompt == (
-        "You have 31 minutes remaining. Continue working on the current task and "
-        "use the remaining time to improve and verify your submission. If you "
-        "determine that the task is already complete, perform any final verification "
-        "you consider appropriate and finish."
+        "You have 31 minutes remaining. Continue the current paper-replication task "
+        "under the original instructions and use the remaining time to improve and "
+        "verify your submission. Do not stop unless you have reproduced all core "
+        "contributions of the paper. If they are already reproduced, verify "
+        "reproduce.sh end to end and finish."
     )
     assert DEFAULT_MIN_REMAINING_SECONDS == 3600
     assert remaining_budget_seconds(time_limit_seconds=7200, start_time=100, now=3700) == 3600
+
+
+def test_execution_feedback_reserves_one_hour_for_review() -> None:
+    assert (
+        execution_feedback_timeout_seconds(
+            remaining_seconds=3 * 3600,
+            minimum_review_seconds=3600,
+            maximum_execution_seconds=3600,
+        )
+        == 3600
+    )
+    assert (
+        execution_feedback_timeout_seconds(
+            remaining_seconds=90 * 60,
+            minimum_review_seconds=3600,
+            maximum_execution_seconds=3600,
+        )
+        == 29 * 60
+    )
+    assert (
+        execution_feedback_timeout_seconds(
+            remaining_seconds=3600,
+            minimum_review_seconds=3600,
+            maximum_execution_seconds=3600,
+        )
+        == 0
+    )
+
+
+def test_execution_feedback_prompt_points_to_harness_log() -> None:
+    prompt = build_execution_feedback_prompt(
+        remaining_seconds=3600,
+        log_path="/home/logs/execution-feedback/iteration-1.log",
+        reproduction_exit_code=1,
+        reproduction_timeout_seconds=1800,
+    )
+
+    assert "60 minutes remaining" in prompt
+    assert "/home/logs/execution-feedback/iteration-1.log" in prompt
+    assert "exit status 1" in prompt
+    assert "up to 30 minutes" in prompt
+    assert "current submission's reproduce.sh in a clean reproduction environment" in prompt
+    assert "actual execution output" in prompt
+    assert "Do not stop unless you have reproduced all core contributions" in prompt
 
 
 def test_codex_review_resume_uses_exact_thread_and_remaining_budget() -> None:
@@ -251,6 +308,109 @@ def test_codex_review_resume_uses_exact_thread_and_remaining_budget() -> None:
     assert "--ephemeral" not in tokens
     assert "3600s" in tokens
     assert "60 minutes" in command
+
+
+def test_codex_review_fork_creates_a_persistent_headless_branch() -> None:
+    command = build_codex_fork_command(
+        parent_thread_id="parent-thread-123",
+        prompt="Review this branch.",
+        model="gpt-5.6-sol",
+        reasoning_effort="high",
+        reasoning_summary="detailed",
+        time_limit=3600,
+    )
+
+    tokens = shlex.split(command)
+    assert tokens[tokens.index("exec") + 1] == "fork"
+    assert "parent-thread-123" in tokens
+    assert "Review this branch." in tokens
+    assert "--ephemeral" not in tokens
+
+
+def test_codex_fork_checkpoint_excludes_auth_and_restores_normalized_inputs() -> None:
+    checkpoint = build_codex_session_checkpoint_command()
+    restore = build_codex_fork_restore_command()
+
+    assert CODEX_FORK_CHECKPOINT_CONTAINER_PATH in checkpoint
+    assert ".codex/sessions" in checkpoint
+    assert "auth.json" not in checkpoint
+    assert "config.toml" not in checkpoint
+    assert CODEX_FORK_SOURCE_ARCHIVE in restore
+    assert CODEX_FORK_SESSION_ARCHIVE in restore
+    assert "staging/submission" in restore
+    assert "--exclude=.codex/auth.json" in restore
+
+
+@pytest.mark.asyncio
+async def test_codex_parent_saves_a_non_secret_fork_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = make_task(tmp_path)
+    source_submission = str(tmp_path / "initial-submission.tar.gz")
+    Path(source_submission).write_bytes(b"submission")
+    monkeypatch.setattr(
+        codex_solver_module,
+        "snapshot_initial_submission",
+        lambda _: source_submission,
+    )
+    computer = FakeComputer(
+        event_log=b'{"type":"thread.started","thread_id":"parent-123"}\n',
+    )
+
+    output = await CodexSolver(save_fork_checkpoint=True)._run_agent(computer, task)
+
+    assert output.error_msg is None
+    metadata = json.loads((Path(task.run_dir) / "codex-fork-checkpoint.json").read_text())
+    assert metadata["parent_thread_id"] == "parent-123"
+    assert metadata["source_submission"] == source_submission
+    assert metadata["auth_included"] is False
+    assert (Path(task.run_dir) / "codex-session-checkpoint.tar.gz").read_bytes() == (
+        b"fork-checkpoint"
+    )
+    checkpoint_commands = [command for command in computer.commands if "tar" in command]
+    assert any(".codex/sessions" in command for command in checkpoint_commands)
+    assert all("auth.json" not in command for command in checkpoint_commands)
+
+
+@pytest.mark.asyncio
+async def test_codex_child_forks_from_the_saved_parent_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = make_task(tmp_path)
+    session_checkpoint = tmp_path / "session.tar.gz"
+    source_submission = tmp_path / "submission.tar.gz"
+    session_checkpoint.write_bytes(b"session")
+    source_submission.write_bytes(b"submission")
+    computer = FakeComputer(
+        review_event_log=b'{"type":"thread.started","thread_id":"branch-456"}\n',
+    )
+    remaining = iter([4000, 3599])
+    monkeypatch.setattr(
+        codex_solver_module,
+        "remaining_budget_seconds",
+        lambda **_: next(remaining),
+    )
+
+    output = await CodexSolver(
+        time_limit=7200,
+        completion_review=True,
+        fork_parent_thread_id="parent-123",
+        fork_session_checkpoint_path=str(session_checkpoint),
+        fork_source_submission_path=str(source_submission),
+    )._run_agent(computer, task)
+
+    assert output.error_msg is None
+    fork_commands = [command for command in computer.commands if "codex exec fork" in command]
+    assert len(fork_commands) == 1
+    assert "parent-123" in fork_commands[0]
+    completion = json.loads((Path(task.run_dir) / "completion-review.json").read_text())
+    assert completion["forked_from_id"] == "parent-123"
+    assert completion["thread_id"] == "branch-456"
+    assert completion["performed"] is True
+    assert completion["review_count"] == 1
+    assert completion["iterations"][0]["operation"] == "fork"
 
 
 @pytest.mark.asyncio
@@ -559,6 +719,51 @@ async def test_codex_solver_repeats_review_while_at_least_one_hour_remains(
     assert completion["completion_reason"] == "insufficient-original-budget"
     assert "review_seconds" not in completion
     assert "environment_variant" not in completion
+
+
+@pytest.mark.asyncio
+async def test_codex_solver_counts_execution_feedback_against_shared_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = make_task(tmp_path)
+    computer = FakeComputer(
+        event_log=b'{"type":"thread.started","thread_id":"thread-123"}\n',
+    )
+    remaining = iter([7200, 3600, 3599])
+    monkeypatch.setattr(
+        codex_solver_module,
+        "remaining_budget_seconds",
+        lambda **_: next(remaining),
+    )
+
+    output = await CodexSolver(
+        time_limit=24 * 3600,
+        completion_review=True,
+        completion_review_mode="execution-log",
+        execution_feedback_timeout_seconds=3600,
+    )._run_agent(computer, task)
+
+    assert output.error_msg is None
+    diagnostic_commands = [
+        command for command in computer.commands if "pb-execution-feedback-" in command
+    ]
+    assert len(diagnostic_commands) == 1
+    assert "timeout --signal=TERM --kill-after=30s 3540s" in diagnostic_commands[0]
+    assert "pb-reproducer:latest" in diagnostic_commands[0]
+    assert "docker cp /home/submission/." in diagnostic_commands[0]
+    assert "--shm-size 8g" in diagnostic_commands[0]
+    assert 'NVIDIA_VISIBLE_DEVICES}" == all' in diagnostic_commands[0]
+    assert "gpu_args=(--gpus all)" in diagnostic_commands[0]
+    review_commands = [command for command in computer.commands if "codex exec resume" in command]
+    assert len(review_commands) == 1
+    assert "/home/logs/execution-feedback/iteration-1.log" in review_commands[0]
+    completion = json.loads((Path(task.run_dir) / "completion-review.json").read_text())
+    assert completion["mode"] == "execution-log"
+    assert completion["budget_policy"] == "shared-agent-and-diagnostic-wall-clock"
+    assert completion["review_count"] == 1
+    assert completion["iterations"][0]["execution_feedback"]["timeout_seconds"] == 3540
+    assert completion["completion_reason"] == "insufficient-original-budget"
 
 
 @pytest.mark.asyncio

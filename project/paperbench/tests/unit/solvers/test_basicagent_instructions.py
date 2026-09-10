@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 import paperbench.solvers.basicagent.solver as basicagent_solver_module
+from nanoeval.solvers.computer_tasks.code_execution_interface import ExecutionResult
 from paperbench.solvers.basicagent.solver import BasicAgentSolver
 from paperbench.solvers.basicagent.utils import get_task_instruction_text
 
@@ -39,6 +40,97 @@ def test_completion_review_is_opt_in_with_a_fixed_one_hour_floor() -> None:
 
     assert solver.completion_review is False
     assert solver.completion_review_min_remaining_seconds == 3600
+    assert solver.completion_review_mode == "generic"
+    assert solver.execution_feedback_timeout_seconds == 3600
+
+
+@pytest.mark.asyncio
+async def test_basicagent_execution_feedback_uses_the_shared_budget(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls = 0
+
+    async def fake_request(**_: object) -> SimpleNamespace:
+        nonlocal calls
+        calls += 1
+        return SimpleNamespace(
+            response_messages=[],
+            tool_calls=[SimpleNamespace(call_id=f"submit-{calls}")],
+            time_spent_retrying=0,
+        )
+
+    async def fake_handle(*_: object, **__: object) -> None:
+        return None
+
+    async def fake_optional_upload(**kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            last_time_uploaded=kwargs["last_time_uploaded"],
+            upload_task=None,
+        )
+
+    async def fake_upload(**_: object) -> None:
+        return None
+
+    class FeedbackComputer:
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+
+        async def send_shell_command(self, command: str) -> ExecutionResult:
+            self.commands.append(command)
+            return ExecutionResult(output=b"diagnostic output", exit_code=1)
+
+    remaining = iter([7200, 3600, 3599])
+    monkeypatch.setattr(basicagent_solver_module, "make_completer_request", fake_request)
+    monkeypatch.setattr(basicagent_solver_module, "handle_tool_call", fake_handle)
+    monkeypatch.setattr(
+        basicagent_solver_module,
+        "optionally_upload_heavy_logs",
+        fake_optional_upload,
+    )
+    monkeypatch.setattr(basicagent_solver_module, "upload_heavy_logs", fake_upload)
+    monkeypatch.setattr(
+        basicagent_solver_module,
+        "remaining_budget_seconds",
+        lambda **_: next(remaining),
+    )
+    monkeypatch.setattr(
+        basicagent_solver_module,
+        "snapshot_initial_submission",
+        lambda _: "/tmp/initial-submission.tar.gz",
+    )
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    task = SimpleNamespace(
+        run_id="test-run",
+        run_group_id="group",
+        runs_dir=str(tmp_path),
+        run_dir=str(run_dir),
+    )
+    solver = BasicAgentSolver(
+        time_limit=24 * 3600,
+        completion_review=True,
+        completion_review_mode="execution-log",
+    )
+    monkeypatch.setattr(type(solver.completer_config), "build", lambda _: object())
+    monkeypatch.setattr(BasicAgentSolver, "_has_agent_finished", lambda *_args, **_kwargs: False)
+    computer = FeedbackComputer()
+
+    steps = await solver._execute_agent(
+        computer=computer,  # type: ignore[arg-type]
+        task=task,
+        prompt=[{"role": "user", "content": "task"}],
+        start_time=0,
+    )
+
+    assert steps == 2
+    assert calls == 2
+    assert len(computer.commands) == 1
+    assert "timeout --signal=TERM --kill-after=30s 3540s" in computer.commands[0]
+    completion = json.loads((run_dir / "completion-review.json").read_text())
+    assert completion["mode"] == "execution-log"
+    assert completion["review_count"] == 1
+    assert completion["iterations"][0]["execution_feedback"]["exit_code"] == 1
 
 
 @pytest.mark.asyncio

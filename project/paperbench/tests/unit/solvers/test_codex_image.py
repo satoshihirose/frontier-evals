@@ -10,8 +10,10 @@ def test_codex_image_pins_cli_and_extends_paperbench_agent_image() -> None:
         PAPERBENCH_ROOT / "paperbench" / "solvers" / "codex" / "Dockerfile.agent"
     ).read_text()
 
-    assert "ARG CODEX_VERSION=0.144.2" in dockerfile
+    assert "ARG CODEX_VERSION=0.154.0" in dockerfile
     assert 'npm install --global "@openai/codex@${CODEX_VERSION}"' in dockerfile
+    assert "codex exec fork --help" in dockerfile
+    assert "Fork a previous session by id into a new session" in dockerfile
     assert "FROM pb-env:latest" in dockerfile
     assert "RUN mkdir -p /home/.codex" in dockerfile
     assert "RUN codex --version" in dockerfile

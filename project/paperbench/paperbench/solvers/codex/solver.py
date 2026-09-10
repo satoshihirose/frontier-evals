@@ -21,7 +21,7 @@ from nanoeval.solvers.computer_tasks.code_execution_interface import (
     ComputerInterface,
     ExecutionResult,
 )
-from paperbench.constants import AGENT_DIR_CONFIG, LOGS_DIR, WORKSPACE_BASE
+from paperbench.constants import AGENT_DIR_CONFIG, LOGS_DIR, SUBMISSION_DIR, WORKSPACE_BASE
 from paperbench.nano.structs import AgentOutput
 from paperbench.nano.task import PBTask
 from paperbench.solvers.base import BasePBSolver
@@ -35,7 +35,12 @@ from paperbench.solvers.completion_review import (
     DEFAULT_MIN_REMAINING_SECONDS,
     MAX_CONSECUTIVE_QUICK_UNCHANGED,
     QUICK_UNCHANGED_MAX_SECONDS,
+    CompletionReviewMode,
     build_completion_review_prompt,
+    build_execution_feedback_command,
+    build_execution_feedback_prompt,
+    execution_feedback_paths,
+    execution_feedback_timeout_seconds,
     get_submission_git_head,
     is_quick_unchanged_review,
     remaining_budget_seconds,
@@ -50,6 +55,11 @@ logger = structlog.stdlib.get_logger(component=__name__)
 CODEX_EVENT_LOG = f"{LOGS_DIR}/codex-events.jsonl"
 CODEX_REVIEW_EVENT_LOG = f"{LOGS_DIR}/codex-review-events.jsonl"
 CODEX_ROLLOUT_METADATA = f"{LOGS_DIR}/codex-rollout.json"
+CODEX_FORK_CHECKPOINT_CONTAINER_PATH = f"{LOGS_DIR}/codex-session-checkpoint.tar.gz"
+CODEX_FORK_CHECKPOINT_FILENAME = "codex-session-checkpoint.tar.gz"
+CODEX_FORK_METADATA_FILENAME = "codex-fork-checkpoint.json"
+CODEX_FORK_SOURCE_ARCHIVE = "/tmp/codex-fork-source-submission.tar.gz"
+CODEX_FORK_SESSION_ARCHIVE = "/tmp/codex-fork-session-checkpoint.tar.gz"
 URL_OBSERVATIONS_FILENAME = "url-observations.jsonl"
 CODEX_HOME = f"{WORKSPACE_BASE}/.codex"
 CODEX_AUTH_PATH = f"{CODEX_HOME}/auth.json"
@@ -282,6 +292,88 @@ def build_codex_resume_command(
     return f"{shlex.join(args)} > {shlex.quote(CODEX_REVIEW_EVENT_LOG)} 2>&1"
 
 
+def build_codex_fork_command(
+    *,
+    parent_thread_id: str,
+    prompt: str,
+    model: str,
+    reasoning_effort: ReasoningEffort,
+    reasoning_summary: ReasoningSummary,
+    time_limit: int,
+) -> str:
+    """Fork a saved Codex session into a persistent non-interactive branch."""
+    if not parent_thread_id:
+        raise ValueError("parent_thread_id must be non-empty")
+    if time_limit <= 0:
+        raise ValueError("time_limit must be positive")
+    args = [
+        "env",
+        "-u",
+        "OPENAI_API_KEY",
+        f"CODEX_HOME={CODEX_HOME}",
+        "timeout",
+        "--signal=TERM",
+        "--kill-after=30s",
+        f"{time_limit}s",
+        "codex",
+        "exec",
+        "fork",
+        "--model",
+        model,
+        "-c",
+        f'model_reasoning_effort="{reasoning_effort}"',
+        "-c",
+        f'model_reasoning_summary="{reasoning_summary}"',
+        "--ignore-user-config",
+        "--skip-git-repo-check",
+        "--json",
+        "--dangerously-bypass-approvals-and-sandbox",
+        parent_thread_id,
+        prompt,
+    ]
+    return f"{shlex.join(args)} > {shlex.quote(CODEX_REVIEW_EVENT_LOG)} 2>&1"
+
+
+def build_codex_session_checkpoint_command() -> str:
+    """Archive resumable Codex state without authentication material."""
+    script = "\n".join(
+        [
+            "set -euo pipefail",
+            "paths=(.codex/sessions)",
+            (
+                "for path in .codex/session_index.jsonl .codex/state_5.sqlite "
+                ".codex/state_5.sqlite-shm .codex/state_5.sqlite-wal; do"
+            ),
+            '  [[ ! -e "$path" ]] || paths+=("$path")',
+            "done",
+            f"tar -czf {shlex.quote(CODEX_FORK_CHECKPOINT_CONTAINER_PATH)} "
+            f'-C {WORKSPACE_BASE} "${{paths[@]}}"',
+        ]
+    )
+    return f"bash -lc {shlex.quote(script)}"
+
+
+def build_codex_fork_restore_command() -> str:
+    """Restore the normalized parent submission and non-secret session state."""
+    script = "\n".join(
+        [
+            "set -euo pipefail",
+            f"staging=$(mktemp -d {WORKSPACE_BASE}/.fork-source.XXXXXX)",
+            'cleanup() { rm -rf -- "$staging"; }',
+            "trap cleanup EXIT",
+            f'tar -xzf {shlex.quote(CODEX_FORK_SOURCE_ARCHIVE)} -C "$staging"',
+            'test -d "$staging/submission"',
+            f"rm -rf -- {shlex.quote(SUBMISSION_DIR)}",
+            f'mv "$staging/submission" {shlex.quote(SUBMISSION_DIR)}',
+            (
+                "tar --exclude=.codex/auth.json --exclude=.codex/config.toml "
+                f"-xzf {shlex.quote(CODEX_FORK_SESSION_ARCHIVE)} -C {WORKSPACE_BASE}"
+            ),
+        ]
+    )
+    return f"bash -lc {shlex.quote(script)}"
+
+
 @chz.chz
 class CodexSolver(BasePBSolver):
     """Run Codex CLI inside the standard PaperBench agent computer."""
@@ -319,6 +411,21 @@ class CodexSolver(BasePBSolver):
         default=DEFAULT_MIN_REMAINING_SECONDS,
         doc="Minimum original rollout budget required before starting the review",
     )
+    completion_review_mode: CompletionReviewMode = chz.field(
+        default="generic",
+        doc="Use a neutral review or first expose a harness-run reproduce.sh log",
+    )
+    execution_feedback_timeout_seconds: int = chz.field(
+        default=60 * 60,
+        doc="Maximum reproduce.sh runtime before each execution-log review",
+    )
+    save_fork_checkpoint: bool = chz.field(
+        default=False,
+        doc="Save non-secret Codex session state for later paired review branches",
+    )
+    fork_parent_thread_id: str | None = chz.field(default=None)
+    fork_session_checkpoint_path: str | None = chz.field(default=None)
+    fork_source_submission_path: str | None = chz.field(default=None)
 
     @override
     def shortname(self) -> str:
@@ -428,6 +535,57 @@ class CodexSolver(BasePBSolver):
             extract_url_observations(event_log),
         )
 
+    async def _restore_fork_checkpoint(self, computer: ComputerInterface) -> None:
+        if self.fork_session_checkpoint_path is None:
+            raise ValueError("fork_session_checkpoint_path is required")
+        if self.fork_source_submission_path is None:
+            raise ValueError("fork_source_submission_path is required")
+        await computer.upload(
+            bf.read_bytes(self.fork_session_checkpoint_path),
+            CODEX_FORK_SESSION_ARCHIVE,
+        )
+        await computer.upload(
+            bf.read_bytes(self.fork_source_submission_path),
+            CODEX_FORK_SOURCE_ARCHIVE,
+        )
+        result = await computer.send_shell_command(build_codex_fork_restore_command())
+        if result.exit_code != 0:
+            raise RuntimeError(
+                "Could not restore Codex fork checkpoint: " + result.output.decode(errors="replace")
+            )
+
+    async def _save_fork_checkpoint(
+        self,
+        *,
+        computer: ComputerInterface,
+        task: PBTask,
+        parent_thread_id: str,
+        source_submission: str,
+        remaining_seconds: int,
+    ) -> dict[str, object]:
+        result = await computer.send_shell_command(build_codex_session_checkpoint_command())
+        if result.exit_code != 0:
+            raise RuntimeError(
+                "Could not archive Codex fork checkpoint: " + result.output.decode(errors="replace")
+            )
+        checkpoint = await computer.download(CODEX_FORK_CHECKPOINT_CONTAINER_PATH)
+        checkpoint_path = bf.join(task.run_dir, CODEX_FORK_CHECKPOINT_FILENAME)
+        bf.write_bytes(checkpoint_path, checkpoint)
+        metadata = {
+            "schema_version": 1,
+            "parent_thread_id": parent_thread_id,
+            "session_checkpoint": checkpoint_path,
+            "source_submission": source_submission,
+            "remaining_seconds": remaining_seconds,
+            "auth_included": False,
+            "created_at": time.time(),
+        }
+        bf.write_bytes(
+            bf.join(task.run_dir, CODEX_FORK_METADATA_FILENAME),
+            (json.dumps(metadata, indent=2, sort_keys=True) + "\n").encode(),
+        )
+        return metadata
+
     async def _execute_with_checkpoints(
         self,
         *,
@@ -481,6 +639,24 @@ class CodexSolver(BasePBSolver):
         existing_output = await check_for_existing_run(task)
         if existing_output is not None:
             return existing_output
+        if self.completion_review_mode not in {"generic", "execution-log"}:
+            raise ValueError(f"Unsupported completion_review_mode: {self.completion_review_mode}")
+        if self.execution_feedback_timeout_seconds <= 0:
+            raise ValueError("execution_feedback_timeout_seconds must be positive")
+        fork_inputs = (
+            self.fork_parent_thread_id,
+            self.fork_session_checkpoint_path,
+            self.fork_source_submission_path,
+        )
+        if any(value is not None for value in fork_inputs) and not all(
+            value is not None for value in fork_inputs
+        ):
+            raise ValueError("Codex fork requires parent thread, session, and submission")
+        is_fork_branch = self.fork_parent_thread_id is not None
+        if is_fork_branch and not self.completion_review:
+            raise ValueError("Codex fork branches require completion_review")
+        if self.save_fork_checkpoint and (is_fork_branch or self.completion_review):
+            raise ValueError("save_fork_checkpoint requires an unreviewed parent Agent run")
 
         start_time = time.time()
         await upload_status(
@@ -499,20 +675,85 @@ class CodexSolver(BasePBSolver):
         await computer.upload(effective_instructions.encode(), INSTRUCTIONS_PATH)
         await sanity_check_docker(computer)
 
-        command = build_codex_command(
-            model=self.model,
-            reasoning_effort=self.reasoning_effort,
-            reasoning_summary=self.reasoning_summary,
-            time_limit=self.time_limit,
-            developer_instructions=get_system_message(
-                iterative=False,
-                code_only=task.judge.code_only,
-            ),
-            ephemeral=not self.completion_review,
-        )
         exit_code: int | None = None
         command_output = b""
         error_msg: str | None = None
+        first_fork_feedback: dict[str, object] | None = None
+        first_fork_prompt: str | None = None
+        first_fork_head_before: str | None = None
+        command_started_at = time.time()
+
+        if is_fork_branch:
+            await self._restore_fork_checkpoint(computer)
+            remaining_seconds = remaining_budget_seconds(
+                time_limit_seconds=self.time_limit,
+                start_time=start_time,
+                now=time.time(),
+            )
+            if self.completion_review_mode == "execution-log":
+                diagnostic_timeout = execution_feedback_timeout_seconds(
+                    remaining_seconds=remaining_seconds,
+                    minimum_review_seconds=self.completion_review_min_remaining_seconds,
+                    maximum_execution_seconds=self.execution_feedback_timeout_seconds,
+                )
+                if diagnostic_timeout <= 0:
+                    raise ValueError("Fork branch lacks time for execution feedback and review")
+                feedback_log_path, _ = execution_feedback_paths(1)
+                feedback_started_at = time.time()
+                feedback_result = await computer.send_shell_command(
+                    build_execution_feedback_command(
+                        iteration=1,
+                        timeout_seconds=diagnostic_timeout,
+                    )
+                )
+                feedback_finished_at = time.time()
+                first_fork_feedback = {
+                    "timeout_seconds": diagnostic_timeout,
+                    "log_path": feedback_log_path,
+                    "started_at": feedback_started_at,
+                    "finished_at": feedback_finished_at,
+                    "duration_seconds": feedback_finished_at - feedback_started_at,
+                    "exit_code": feedback_result.exit_code,
+                    "timed_out": feedback_result.exit_code == 124,
+                    "error": None,
+                }
+                remaining_seconds = remaining_budget_seconds(
+                    time_limit_seconds=self.time_limit,
+                    start_time=start_time,
+                    now=time.time(),
+                )
+                if remaining_seconds < self.completion_review_min_remaining_seconds:
+                    raise RuntimeError("Execution feedback consumed the fork branch review budget")
+                first_fork_prompt = build_execution_feedback_prompt(
+                    remaining_seconds=remaining_seconds,
+                    log_path=feedback_log_path,
+                    reproduction_exit_code=feedback_result.exit_code,
+                    reproduction_timeout_seconds=diagnostic_timeout,
+                )
+            else:
+                first_fork_prompt = build_completion_review_prompt(remaining_seconds)
+            first_fork_head_before = await get_submission_git_head(computer)
+            command_started_at = time.time()
+            command = build_codex_fork_command(
+                parent_thread_id=self.fork_parent_thread_id or "",
+                prompt=first_fork_prompt,
+                model=self.model,
+                reasoning_effort=self.reasoning_effort,
+                reasoning_summary=self.reasoning_summary,
+                time_limit=remaining_seconds,
+            )
+        else:
+            command = build_codex_command(
+                model=self.model,
+                reasoning_effort=self.reasoning_effort,
+                reasoning_summary=self.reasoning_summary,
+                time_limit=self.time_limit,
+                developer_instructions=get_system_message(
+                    iterative=False,
+                    code_only=task.judge.code_only,
+                ),
+                ephemeral=not (self.completion_review or self.save_fork_checkpoint),
+            )
 
         try:
             result = await self._execute_with_checkpoints(
@@ -531,17 +772,67 @@ class CodexSolver(BasePBSolver):
             error_msg = f"Codex rollout failed: {exc}"
             logger.exception(error_msg)
 
-        event_log = await self._read_event_log(computer, command_output)
+        command_finished_at = time.time()
+        event_log = await self._read_event_log(
+            computer,
+            command_output,
+            CODEX_REVIEW_EVENT_LOG if is_fork_branch else CODEX_EVENT_LOG,
+        )
+        if is_fork_branch and exit_code == 0 and extract_codex_thread_id(event_log) is None:
+            exit_code = 1
+            error_msg = "Codex fork did not emit a branch thread id"
         initial_exit_code = exit_code
+        fork_checkpoint_metadata: dict[str, object] | None = None
+        if self.save_fork_checkpoint and exit_code == 0:
+            parent_thread_id = extract_codex_thread_id(event_log)
+            if parent_thread_id is None:
+                exit_code = 1
+                error_msg = "Codex parent rollout did not emit a thread id"
+            else:
+                await upload_heavy_logs(
+                    computer=computer,
+                    agent_start_time=int(start_time),
+                    agent_dir_config=AGENT_DIR_CONFIG,
+                    run_dir=task.run_dir,
+                    run_group_id=task.run_group_id,
+                    runs_dir=task.runs_dir,
+                    run_id=task.run_id,
+                    runtime=time.time() - start_time,
+                )
+                source_submission = snapshot_initial_submission(task.run_dir)
+                if source_submission is None:
+                    exit_code = 1
+                    error_msg = "Codex parent rollout did not produce a submission"
+                else:
+                    try:
+                        fork_checkpoint_metadata = await self._save_fork_checkpoint(
+                            computer=computer,
+                            task=task,
+                            parent_thread_id=parent_thread_id,
+                            source_submission=source_submission,
+                            remaining_seconds=remaining_budget_seconds(
+                                time_limit_seconds=self.time_limit,
+                                start_time=start_time,
+                                now=time.time(),
+                            ),
+                        )
+                    except Exception as exc:
+                        exit_code = 1
+                        error_msg = f"Could not save Codex fork checkpoint: {exc}"
+                        logger.exception(error_msg)
         completion_review_metadata: dict[str, object] = {
             "enabled": self.completion_review,
             "performed": False,
+            "mode": self.completion_review_mode,
+            "budget_policy": "shared-agent-and-diagnostic-wall-clock",
             "minimum_remaining_seconds": self.completion_review_min_remaining_seconds,
+            "execution_feedback_timeout_seconds": (self.execution_feedback_timeout_seconds),
             "initial_submission": None,
             "review_count": 0,
             "iterations": [],
             "quick_unchanged_max_seconds": QUICK_UNCHANGED_MAX_SECONDS,
             "max_consecutive_quick_unchanged": MAX_CONSECUTIVE_QUICK_UNCHANGED,
+            "forked_from_id": self.fork_parent_thread_id,
         }
         if self.completion_review and exit_code == 0:
             remaining_seconds = remaining_budget_seconds(
@@ -550,8 +841,61 @@ class CodexSolver(BasePBSolver):
                 now=time.time(),
             )
             completion_review_metadata["remaining_seconds_at_decision"] = remaining_seconds
+            seed_iterations: list[dict[str, object]] = []
+            seed_consecutive_quick_unchanged = 0
+            if is_fork_branch:
+                branch_thread_id = extract_codex_thread_id(event_log)
+                first_fork_head_after = await get_submission_git_head(computer)
+                first_fork_quick_unchanged = is_quick_unchanged_review(
+                    head_before=first_fork_head_before,
+                    head_after=first_fork_head_after,
+                    started_at=command_started_at,
+                    finished_at=command_finished_at,
+                )
+                seed_consecutive_quick_unchanged = int(first_fork_quick_unchanged)
+                seed_iterations.append(
+                    {
+                        "index": 1,
+                        "operation": "fork",
+                        "prompt": first_fork_prompt,
+                        "remaining_seconds_at_start": max(
+                            0,
+                            self.time_limit - int(command_started_at - start_time),
+                        ),
+                        "started_at": command_started_at,
+                        "finished_at": command_finished_at,
+                        "exit_code": exit_code,
+                        "duration_seconds": command_finished_at - command_started_at,
+                        "git_head_before": first_fork_head_before,
+                        "git_head_after": first_fork_head_after,
+                        "quick_unchanged": first_fork_quick_unchanged,
+                        "consecutive_quick_unchanged": (seed_consecutive_quick_unchanged),
+                        **(
+                            {"execution_feedback": first_fork_feedback}
+                            if first_fork_feedback is not None
+                            else {}
+                        ),
+                    }
+                )
+                completion_review_metadata.update(
+                    {
+                        "performed": True,
+                        "thread_id": branch_thread_id,
+                        "prompt": first_fork_prompt,
+                        "started_at": command_started_at,
+                        "finished_at": command_finished_at,
+                        "exit_code": exit_code,
+                        "initial_submission": self.fork_source_submission_path,
+                        "review_count": 1,
+                        "iterations": seed_iterations,
+                        "consecutive_quick_unchanged": (seed_consecutive_quick_unchanged),
+                    }
+                )
             if remaining_seconds < self.completion_review_min_remaining_seconds:
-                completion_review_metadata["skip_reason"] = "insufficient-original-budget"
+                if is_fork_branch:
+                    completion_review_metadata["completion_reason"] = "insufficient-original-budget"
+                else:
+                    completion_review_metadata["skip_reason"] = "insufficient-original-budget"
             else:
                 thread_id = extract_codex_thread_id(event_log)
                 if thread_id is None:
@@ -567,14 +911,87 @@ class CodexSolver(BasePBSolver):
                         run_id=task.run_id,
                         runtime=time.time() - start_time,
                     )
-                    initial_submission = snapshot_initial_submission(task.run_dir)
-                    iterations: list[dict[str, object]] = []
-                    consecutive_quick_unchanged = 0
+                    initial_submission = (
+                        self.fork_source_submission_path
+                        if is_fork_branch
+                        else snapshot_initial_submission(task.run_dir)
+                    )
+                    iterations = seed_iterations
+                    consecutive_quick_unchanged = seed_consecutive_quick_unchanged
                     while (
                         exit_code == 0
                         and remaining_seconds >= self.completion_review_min_remaining_seconds
                     ):
-                        review_prompt = build_completion_review_prompt(remaining_seconds)
+                        execution_feedback: dict[str, object] | None = None
+                        if self.completion_review_mode == "execution-log":
+                            diagnostic_timeout = execution_feedback_timeout_seconds(
+                                remaining_seconds=remaining_seconds,
+                                minimum_review_seconds=(
+                                    self.completion_review_min_remaining_seconds
+                                ),
+                                maximum_execution_seconds=(self.execution_feedback_timeout_seconds),
+                            )
+                            if diagnostic_timeout <= 0:
+                                completion_review_metadata["completion_reason"] = (
+                                    "insufficient-budget-for-execution-feedback"
+                                )
+                                break
+                            feedback_index = len(iterations) + 1
+                            feedback_log_path, _ = execution_feedback_paths(feedback_index)
+                            feedback_command = build_execution_feedback_command(
+                                iteration=feedback_index,
+                                timeout_seconds=diagnostic_timeout,
+                            )
+                            feedback_started_at = time.time()
+                            try:
+                                feedback_result = await computer.send_shell_command(
+                                    feedback_command
+                                )
+                                feedback_exit_code = feedback_result.exit_code
+                                feedback_error = None
+                            except Exception as exc:
+                                feedback_exit_code = 1
+                                feedback_error = str(exc)
+                                error_msg = f"Execution feedback failed: {exc}"
+                                logger.exception(error_msg)
+                            feedback_finished_at = time.time()
+                            execution_feedback = {
+                                "timeout_seconds": diagnostic_timeout,
+                                "log_path": feedback_log_path,
+                                "started_at": feedback_started_at,
+                                "finished_at": feedback_finished_at,
+                                "duration_seconds": (feedback_finished_at - feedback_started_at),
+                                "exit_code": feedback_exit_code,
+                                "timed_out": feedback_exit_code == 124,
+                                "error": feedback_error,
+                            }
+                            if feedback_error is not None:
+                                exit_code = 1
+                                completion_review_metadata["completion_reason"] = (
+                                    "execution-feedback-infrastructure-error"
+                                )
+                                break
+                            remaining_seconds = remaining_budget_seconds(
+                                time_limit_seconds=self.time_limit,
+                                start_time=start_time,
+                                now=time.time(),
+                            )
+                            completion_review_metadata[
+                                "remaining_seconds_after_execution_feedback"
+                            ] = remaining_seconds
+                            if remaining_seconds < self.completion_review_min_remaining_seconds:
+                                completion_review_metadata["completion_reason"] = (
+                                    "insufficient-original-budget"
+                                )
+                                break
+                            review_prompt = build_execution_feedback_prompt(
+                                remaining_seconds=remaining_seconds,
+                                log_path=feedback_log_path,
+                                reproduction_exit_code=feedback_exit_code,
+                                reproduction_timeout_seconds=diagnostic_timeout,
+                            )
+                        else:
+                            review_prompt = build_completion_review_prompt(remaining_seconds)
                         review_command = build_codex_resume_command(
                             thread_id=thread_id,
                             prompt=review_prompt,
@@ -638,6 +1055,11 @@ class CodexSolver(BasePBSolver):
                                 "git_head_after": head_after,
                                 "quick_unchanged": quick_unchanged,
                                 "consecutive_quick_unchanged": consecutive_quick_unchanged,
+                                **(
+                                    {"execution_feedback": execution_feedback}
+                                    if execution_feedback is not None
+                                    else {}
+                                ),
                             }
                         )
                         completion_review_metadata.update(
@@ -708,6 +1130,9 @@ class CodexSolver(BasePBSolver):
             "operating_instructions": "basicagent_system_as_codex_developer",
             "url_observations_file": URL_OBSERVATIONS_FILENAME,
             "completion_review": completion_review_metadata,
+            "thread_id": extract_codex_thread_id(event_log),
+            "forked_from_id": self.fork_parent_thread_id,
+            "fork_checkpoint": fork_checkpoint_metadata,
         }
         await computer.upload(
             json.dumps(rollout_metadata, indent=2).encode(),
