@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import shlex
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -47,8 +49,12 @@ from paperbench.solvers.codex.solver import (
     extract_url_observations,
 )
 from paperbench.solvers.completion_review import (
+    _COPY_CHANGED_ARTIFACTS_SCRIPT,
+    _SNAPSHOT_SCRIPT,
     DEFAULT_MIN_REMAINING_SECONDS,
+    EXECUTION_FEEDBACK_MAX_ARTIFACT_BYTES,
     build_completion_review_prompt,
+    build_execution_feedback_command,
     build_execution_feedback_prompt,
     execution_feedback_timeout_seconds,
     remaining_budget_seconds,
@@ -272,20 +278,83 @@ def test_execution_feedback_reserves_one_hour_for_review() -> None:
     )
 
 
-def test_execution_feedback_prompt_points_to_harness_log() -> None:
+def test_execution_feedback_matches_formal_reproduction_contract() -> None:
+    command = build_execution_feedback_command(iteration=2, timeout_seconds=3600)
+
+    assert "--env-file /home/agent.env" in command
+    assert "--network bridge" in command
+    assert "update-alternatives --set python3 /usr/bin/python3.11" in command
+    assert "python3 -m venv venv" in command
+    assert command.count("docker create") == 1
+    assert "attempt_options=" in command
+    assert "600" in command
+    assert "reproduce.log" in command
+    assert "harness.log" in command
+    assert "artifacts" in command
+    assert "artifact-manifest" not in command
+
+
+def test_execution_feedback_copies_only_small_created_or_changed_files(tmp_path: Path) -> None:
+    submission = tmp_path / "submission"
+    destination = tmp_path / "artifacts"
+    snapshot = tmp_path / "before.json"
+    submission.mkdir()
+    (submission / "unchanged.txt").write_text("same")
+    (submission / "changed.txt").write_text("before")
+    (submission / "link").symlink_to("unchanged.txt")
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _SNAPSHOT_SCRIPT,
+            str(submission),
+            str(snapshot),
+            str(EXECUTION_FEEDBACK_MAX_ARTIFACT_BYTES),
+        ],
+        check=True,
+    )
+    (submission / "changed.txt").write_text("after")
+    (submission / "new.txt").write_text("new")
+    (submission / "too-large.bin").write_bytes(
+        b"x" * (EXECUTION_FEEDBACK_MAX_ARTIFACT_BYTES + 1)
+    )
+    (submission / "reproduce.log").write_text("diagnostic log")
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _COPY_CHANGED_ARTIFACTS_SCRIPT,
+            str(submission),
+            str(snapshot),
+            str(destination),
+            str(EXECUTION_FEEDBACK_MAX_ARTIFACT_BYTES),
+        ],
+        check=True,
+    )
+
+    copied = sorted(path.relative_to(destination).as_posix() for path in destination.rglob("*"))
+    assert copied == ["changed.txt", "new.txt"]
+
+
+def test_execution_feedback_prompt_points_to_reproduction_evidence() -> None:
     prompt = build_execution_feedback_prompt(
         remaining_seconds=3600,
-        log_path="/home/logs/execution-feedback/iteration-1.log",
+        log_path="/home/logs/execution-feedback/iteration-1/reproduce.log",
         reproduction_exit_code=1,
         reproduction_timeout_seconds=1800,
     )
 
     assert "60 minutes remaining" in prompt
-    assert "/home/logs/execution-feedback/iteration-1.log" in prompt
+    assert "/home/logs/execution-feedback/iteration-1/reproduce.log" in prompt
+    assert "/home/logs/execution-feedback/iteration-1/artifacts" in prompt
     assert "exit status 1" in prompt
     assert "up to 30 minutes" in prompt
-    assert "current submission's reproduce.sh in a clean reproduction environment" in prompt
+    assert "production reproduction image" in prompt
+    assert "environment variables, network access, and salvage variants" in prompt
     assert "actual execution output" in prompt
+    assert "harness.log" not in prompt
     assert "Do not stop unless you have reproduced all core contributions" in prompt
 
 
@@ -749,7 +818,7 @@ async def test_codex_solver_counts_execution_feedback_against_shared_budget(
         command for command in computer.commands if "pb-execution-feedback-" in command
     ]
     assert len(diagnostic_commands) == 1
-    assert "timeout --signal=TERM --kill-after=30s 3540s" in diagnostic_commands[0]
+    assert "diagnostic_budget_seconds=3540" in diagnostic_commands[0]
     assert "pb-reproducer:latest" in diagnostic_commands[0]
     assert "docker cp /home/submission/." in diagnostic_commands[0]
     assert "--shm-size 8g" in diagnostic_commands[0]
@@ -757,7 +826,7 @@ async def test_codex_solver_counts_execution_feedback_against_shared_budget(
     assert "gpu_args=(--gpus all)" in diagnostic_commands[0]
     review_commands = [command for command in computer.commands if "codex exec resume" in command]
     assert len(review_commands) == 1
-    assert "/home/logs/execution-feedback/iteration-1.log" in review_commands[0]
+    assert "/home/logs/execution-feedback/iteration-1/reproduce.log" in review_commands[0]
     completion = json.loads((Path(task.run_dir) / "completion-review.json").read_text())
     assert completion["mode"] == "execution-log"
     assert completion["budget_policy"] == "shared-agent-and-diagnostic-wall-clock"

@@ -276,6 +276,17 @@ repeated no-op resumes after the agent has already finished while preserving the
 for reviews that continue to make changes. This is opt-in and does not add time beyond the
 original limit.
 
+Set `completion_review_mode=execution-log` to precede each review with a diagnostic
+Reproduction. The diagnostic uses `pb-reproducer:latest`, 8 GiB shared memory, unrestricted
+outbound network access, the same `agent.env`, and the same Python 3.12/3.11 × managed-venv
+salvage order as formal Reproduction. Its four attempts share one diagnostic budget (one hour by
+default) and retain the 600-second early-exit threshold. The selected attempt's log is stored at
+`/home/logs/execution-feedback/iteration-N/reproduce.log`; regular files created or changed by
+`reproduce.sh` and no larger than 10 MiB are copied with their relative paths under the adjacent
+`artifacts/` directory. No artifact manifest is generated. Container-launch diagnostics are not
+given to the implementation agent; an infrastructure failure ends the intervention instead of
+asking the agent to modify its submission.
+
 PaperBench also supports `paperbench.requirements_mode=rubric-criteria`. This uploads
 `/home/paper/rubric_criteria.json`, a flat JSON array of the rubric leaves' `requirements` text
 copied verbatim. Weights, hierarchy, IDs, `judge.addendum.md`, and grader-only fields are not

@@ -57,6 +57,7 @@ from paperbench.solvers.completion_review import (
     execution_feedback_paths,
     execution_feedback_timeout_seconds,
     get_submission_git_head,
+    is_execution_feedback_infrastructure_error,
     is_quick_unchanged_review,
     remaining_budget_seconds,
     snapshot_initial_submission,
@@ -352,6 +353,26 @@ class BasicAgentSolver(BasePBSolver):
                                             "timed_out": feedback_result.exit_code == 124,
                                             "error": None,
                                         }
+                                        if is_execution_feedback_infrastructure_error(
+                                            feedback_result.exit_code
+                                        ):
+                                            write_completion_review_metadata(
+                                                task.run_dir,
+                                                {
+                                                    "enabled": True,
+                                                    "performed": review_count > 0,
+                                                    "mode": self.completion_review_mode,
+                                                    "budget_policy": "shared-agent-and-diagnostic-wall-clock",
+                                                    "minimum_remaining_seconds": self.completion_review_min_remaining_seconds,
+                                                    "execution_feedback_timeout_seconds": self.execution_feedback_timeout_seconds,
+                                                    "remaining_seconds_at_decision": remaining_seconds,
+                                                    "initial_submission": initial_submission,
+                                                    "review_count": review_count,
+                                                    "iterations": review_iterations,
+                                                    "completion_reason": "execution-feedback-infrastructure-error",
+                                                },
+                                            )
+                                            return num_steps
                                         remaining_seconds = remaining_budget_seconds(
                                             time_limit_seconds=self.time_limit,
                                             start_time=start_time,

@@ -42,6 +42,7 @@ from paperbench.solvers.completion_review import (
     execution_feedback_paths,
     execution_feedback_timeout_seconds,
     get_submission_git_head,
+    is_execution_feedback_infrastructure_error,
     is_quick_unchanged_review,
     remaining_budget_seconds,
     snapshot_initial_submission,
@@ -707,6 +708,8 @@ class CodexSolver(BasePBSolver):
                     )
                 )
                 feedback_finished_at = time.time()
+                if is_execution_feedback_infrastructure_error(feedback_result.exit_code):
+                    raise RuntimeError("Execution-feedback reproduction infrastructure failed")
                 first_fork_feedback = {
                     "timeout_seconds": diagnostic_timeout,
                     "log_path": feedback_log_path,
@@ -948,7 +951,13 @@ class CodexSolver(BasePBSolver):
                                     feedback_command
                                 )
                                 feedback_exit_code = feedback_result.exit_code
-                                feedback_error = None
+                                feedback_error = (
+                                    "Execution-feedback reproduction infrastructure failed"
+                                    if is_execution_feedback_infrastructure_error(
+                                        feedback_exit_code
+                                    )
+                                    else None
+                                )
                             except Exception as exc:
                                 feedback_exit_code = 1
                                 feedback_error = str(exc)

@@ -21,6 +21,7 @@ from paperbench.computer_utils import (
 )
 from paperbench.infra.alcatraz import tar_and_extract_from_computer
 from paperbench.nano.structs import PBRuntimeConfig, ReproductionMetadata, ReproScriptRunOutcome
+from paperbench.reproduction_policy import REPRODUCTION_SALVAGE_ATTEMPTS
 from paperbench.utils import get_agents_env_vars
 
 logger = structlog.stdlib.get_logger(component=__name__)
@@ -317,15 +318,11 @@ async def reproduce_on_computer_with_salvaging(
     valid_threshold = True if timeout is None else retry_threshold < timeout
     retries_enabled = retry_threshold > 0 and valid_threshold
 
-    retry_options = [{"use_py3_11": False, "make_venv": False}]
-    if retries_enabled:
-        retry_options.extend(
-            [
-                {"use_py3_11": True, "make_venv": False},
-                {"use_py3_11": False, "make_venv": True},
-                {"use_py3_11": True, "make_venv": True},
-            ]
-        )
+    retry_options = (
+        REPRODUCTION_SALVAGE_ATTEMPTS
+        if retries_enabled
+        else REPRODUCTION_SALVAGE_ATTEMPTS[:1]
+    )
 
     repro_attempts: list[ReproductionMetadata] = []
 
@@ -335,8 +332,8 @@ async def reproduce_on_computer_with_salvaging(
 
     for attempt_index, opts in enumerate(retry_options):
         ctx_logger.info(
-            f"Executing reproduce.sh with py3_11={opts['use_py3_11']}"
-            f" and make_venv={opts['make_venv']}"
+            f"Executing reproduce.sh with py3_11={opts.use_py3_11}"
+            f" and make_venv={opts.make_venv}"
         )
         repro_attempt = await reproduce_on_computer(
             computer_runtime=computer_runtime,
@@ -350,8 +347,8 @@ async def reproduce_on_computer_with_salvaging(
             submission_cluster_path=submission_cluster_path,
             output_cluster_path=output_cluster_path,
             timeout=timeout,
-            use_py3_11=opts["use_py3_11"],
-            make_venv=opts["make_venv"],
+            use_py3_11=opts.use_py3_11,
+            make_venv=opts.make_venv,
             attempt_index=attempt_index if retries_enabled else None,
         )
         repro_attempts.append(repro_attempt)

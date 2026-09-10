@@ -126,7 +126,7 @@ async def test_basicagent_execution_feedback_uses_the_shared_budget(
     assert steps == 2
     assert calls == 2
     assert len(computer.commands) == 1
-    assert "timeout --signal=TERM --kill-after=30s 3540s" in computer.commands[0]
+    assert "diagnostic_budget_seconds=3540" in computer.commands[0]
     completion = json.loads((run_dir / "completion-review.json").read_text())
     assert completion["mode"] == "execution-log"
     assert completion["review_count"] == 1

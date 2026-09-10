@@ -11,6 +11,7 @@ import blobfile as bf
 
 from nanoeval.solvers.computer_tasks.code_execution_interface import ComputerInterface
 from paperbench.constants import SUBMISSION_DIR
+from paperbench.reproduction_policy import REPRODUCTION_SALVAGE_ATTEMPTS
 
 DEFAULT_MIN_REMAINING_SECONDS = 60 * 60
 QUICK_UNCHANGED_MAX_SECONDS = 5 * 60
@@ -21,7 +22,75 @@ SUBMISSION_GIT_HEAD_COMMAND = f"git -C {SUBMISSION_DIR} rev-parse HEAD"
 EXECUTION_FEEDBACK_DIR = "/home/logs/execution-feedback"
 EXECUTION_FEEDBACK_SETUP_RESERVE_SECONDS = 60
 EXECUTION_FEEDBACK_IMAGE = "pb-reproducer:latest"
+EXECUTION_FEEDBACK_ENV_FILE = "/home/agent.env"
+EXECUTION_FEEDBACK_NETWORK = "bridge"
+EXECUTION_FEEDBACK_RETRY_THRESHOLD_SECONDS = 600
+EXECUTION_FEEDBACK_ARTIFACT_RESERVE_SECONDS = 30
+EXECUTION_FEEDBACK_MAX_ARTIFACT_BYTES = 10 * 1024 * 1024
+EXECUTION_FEEDBACK_INFRASTRUCTURE_EXIT_CODE = 125
+EXECUTION_FEEDBACK_INFRASTRUCTURE_MARKER = "/tmp/execution-feedback-infrastructure-error"
 CompletionReviewMode = Literal["generic", "execution-log"]
+
+_SNAPSHOT_SCRIPT = """
+import hashlib
+import json
+import os
+import stat
+import sys
+
+root, output, max_size = sys.argv[1], sys.argv[2], int(sys.argv[3])
+snapshot = {}
+for current, directories, files in os.walk(root, followlinks=False):
+    directories[:] = sorted(directories)
+    for name in sorted(files):
+        path = os.path.join(current, name)
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > max_size:
+            continue
+        relative = os.path.relpath(path, root)
+        if relative in {"reproduce.log", "reproduce.log.creation_time"}:
+            continue
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        snapshot[relative] = digest.hexdigest()
+with open(output, "w", encoding="utf-8") as handle:
+    json.dump(snapshot, handle, sort_keys=True)
+""".strip()
+
+_COPY_CHANGED_ARTIFACTS_SCRIPT = """
+import hashlib
+import json
+import os
+import shutil
+import stat
+import sys
+
+root, snapshot_path, destination, max_size = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+with open(snapshot_path, encoding="utf-8") as handle:
+    before = json.load(handle)
+os.makedirs(destination, exist_ok=True)
+for current, directories, files in os.walk(root, followlinks=False):
+    directories[:] = sorted(directories)
+    for name in sorted(files):
+        path = os.path.join(current, name)
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > max_size:
+            continue
+        relative = os.path.relpath(path, root)
+        if relative in {"reproduce.log", "reproduce.log.creation_time"}:
+            continue
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if before.get(relative) == digest.hexdigest():
+            continue
+        target = os.path.join(destination, relative)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        shutil.copy2(path, target, follow_symlinks=False)
+""".strip()
 
 
 def remaining_budget_seconds(
@@ -63,35 +132,112 @@ def execution_feedback_timeout_seconds(
     return max(0, min(maximum_execution_seconds, available))
 
 
+def is_execution_feedback_infrastructure_error(exit_code: int) -> bool:
+    return exit_code == EXECUTION_FEEDBACK_INFRASTRUCTURE_EXIT_CODE
+
+
 def execution_feedback_paths(iteration: int) -> tuple[str, str]:
     if iteration <= 0:
         raise ValueError("iteration must be positive")
+    feedback_dir = f"{EXECUTION_FEEDBACK_DIR}/iteration-{iteration}"
     return (
-        f"{EXECUTION_FEEDBACK_DIR}/iteration-{iteration}.log",
-        f"/tmp/paperbench-execution-feedback-{iteration}",
+        f"{feedback_dir}/reproduce.log",
+        f"/tmp/paperbench-execution-feedback-{iteration}/harness.log",
     )
 
 
-def build_execution_feedback_command(*, iteration: int, timeout_seconds: int) -> str:
-    """Run reproduce.sh in a disposable reproducer without changing the submission."""
-    if timeout_seconds <= 0:
-        raise ValueError("timeout_seconds must be positive")
-    log_path, _ = execution_feedback_paths(iteration)
-    container_name = f"pb-execution-feedback-{uuid.uuid4().hex}"
-    container_command = "\n".join(
+def _build_reproduction_container_command() -> str:
+    return "\n".join(
         [
-            "set -euo pipefail",
+            "set -uo pipefail",
             "cd /submission",
             "rm -rf -- venv .venv",
-            "bash reproduce.sh",
+            "mkdir -p /tmp/execution-feedback-artifacts",
+            ": > reproduce.log",
+            "setup_status=0",
+            (
+                'if [[ "$PB_USE_PY3_11" == 1 ]]; then '
+                "update-alternatives --set python3 /usr/bin/python3.11 || setup_status=$?; fi"
+            ),
+            (
+                'if [[ "$setup_status" == 0 && "$PB_MAKE_VENV" == 1 ]]; then '
+                "python3 -m venv venv && source venv/bin/activate || setup_status=$?; fi"
+            ),
+            (
+                'if [[ "$setup_status" != 0 ]]; then '
+                "tar -czf /tmp/execution-feedback-artifacts.tar.gz "
+                "-C /tmp/execution-feedback-artifacts .; exit \"$setup_status\"; fi"
+            ),
+            (
+                f"python3 -c {shlex.quote(_SNAPSHOT_SCRIPT)} /submission "
+                f"/tmp/execution-feedback-before.json {EXECUTION_FEEDBACK_MAX_ARTIFACT_BYTES} "
+                f"|| {{ touch {EXECUTION_FEEDBACK_INFRASTRUCTURE_MARKER}; "
+                f"exit {EXECUTION_FEEDBACK_INFRASTRUCTURE_EXIT_CODE}; }}"
+            ),
+            "date +%s > reproduce.log.creation_time",
+            (
+                f"attempt_timeout=$((PB_DIAGNOSTIC_DEADLINE - $(date +%s) - "
+                f"{EXECUTION_FEEDBACK_ARTIFACT_RESERVE_SECONDS}))"
+            ),
+            (
+                "if (( attempt_timeout <= 0 )); then "
+                "tar -czf /tmp/execution-feedback-artifacts.tar.gz "
+                "-C /tmp/execution-feedback-artifacts .; exit 124; fi"
+            ),
+            "set +e",
+            (
+                'timeout --signal=TERM --kill-after=30s "${attempt_timeout}s" '
+                "bash -o pipefail -c 'bash reproduce.sh 2>&1 | tee reproduce.log'"
+            ),
+            "reproduction_status=$?",
+            "set -e",
+            (
+                f"python3 -c {shlex.quote(_COPY_CHANGED_ARTIFACTS_SCRIPT)} /submission "
+                "/tmp/execution-feedback-before.json /tmp/execution-feedback-artifacts "
+                f"{EXECUTION_FEEDBACK_MAX_ARTIFACT_BYTES} "
+                f"|| {{ touch {EXECUTION_FEEDBACK_INFRASTRUCTURE_MARKER}; "
+                f"exit {EXECUTION_FEEDBACK_INFRASTRUCTURE_EXIT_CODE}; }}"
+            ),
+            (
+                "tar -czf /tmp/execution-feedback-artifacts.tar.gz "
+                "-C /tmp/execution-feedback-artifacts . "
+                f"|| {{ touch {EXECUTION_FEEDBACK_INFRASTRUCTURE_MARKER}; "
+                f"exit {EXECUTION_FEEDBACK_INFRASTRUCTURE_EXIT_CODE}; }}"
+            ),
+            'exit "$reproduction_status"',
         ]
     )
-    diagnostic_script = "\n".join(
+
+
+def _build_execution_feedback_driver(*, iteration: int, timeout_seconds: int) -> str:
+    log_path, harness_log_path = execution_feedback_paths(iteration)
+    feedback_dir = log_path.rsplit("/", 1)[0]
+    harness_dir = harness_log_path.rsplit("/", 1)[0]
+    container_prefix = f"pb-execution-feedback-{uuid.uuid4().hex}"
+    attempt_options = " ".join(
+        shlex.quote(f"{int(attempt.use_py3_11)} {int(attempt.make_venv)}")
+        for attempt in REPRODUCTION_SALVAGE_ATTEMPTS
+    )
+    container_command = _build_reproduction_container_command()
+    driver = "\n".join(
         [
-            "set -euo pipefail",
-            f"container_name={shlex.quote(container_name)}",
-            'cleanup() { docker rm -f "$container_name" >/dev/null 2>&1 || true; }',
+            "set -uo pipefail",
+            f"feedback_dir={shlex.quote(feedback_dir)}",
+            f"harness_dir={shlex.quote(harness_dir)}",
+            f"harness_log={shlex.quote(harness_log_path)}",
+            f"container_prefix={shlex.quote(container_prefix)}",
+            'container_name=""',
+            (
+                'cleanup() { if [[ -n "$container_name" ]]; then '
+                'docker rm -f "$container_name" >/dev/null 2>&1 || true; fi; }'
+            ),
             "trap cleanup EXIT",
+            f"diagnostic_budget_seconds={timeout_seconds}",
+            'deadline_epoch=$(($(date +%s) + diagnostic_budget_seconds))',
+            f"attempt_options=({attempt_options})",
+            'rm -rf -- "$feedback_dir" "$harness_dir"',
+            'mkdir -p "$feedback_dir/attempts" "$harness_dir"',
+            ': > "$harness_log"',
             "gpu_args=()",
             (
                 'if [[ -n "${NVIDIA_VISIBLE_DEVICES:-}" '
@@ -103,34 +249,126 @@ def build_execution_feedback_command(*, iteration: int, timeout_seconds: int) ->
             '    gpu_args=(--gpus "device=${NVIDIA_VISIBLE_DEVICES}")',
             "  fi",
             "fi",
+            "env_args=()",
             (
-                'docker create --name "$container_name" --shm-size 8g '
-                '"${gpu_args[@]}" '
+                f"if [[ -f {shlex.quote(EXECUTION_FEEDBACK_ENV_FILE)} ]]; then "
+                f"env_args=(--env-file {shlex.quote(EXECUTION_FEEDBACK_ENV_FILE)}); fi"
+            ),
+            "durations=()",
+            "statuses=()",
+            "attempt_count=0",
+            "terminal_attempt=-1",
+            "for option in \"${attempt_options[@]}\"; do",
+            (
+                f"  remaining=$((deadline_epoch - $(date +%s) - "
+                f"{EXECUTION_FEEDBACK_ARTIFACT_RESERVE_SECONDS}))"
+            ),
+            "  if (( remaining <= 0 )); then break; fi",
+            '  read -r use_py3_11 make_venv <<< "$option"',
+            "  attempt_index=$attempt_count",
+            "  attempt_number=$((attempt_index + 1))",
+            '  attempt_dir="$feedback_dir/attempts/attempt-$attempt_number"',
+            '  container_name="$container_prefix-$attempt_number"',
+            '  mkdir -p "$attempt_dir/artifacts"',
+            '  started=$SECONDS',
+            '  docker rm -f "$container_name" >/dev/null 2>&1 || true',
+            (
+                '  if ! docker create --name "$container_name" --shm-size 8g '
+                f"--network {shlex.quote(EXECUTION_FEEDBACK_NETWORK)} "
+                '"${gpu_args[@]}" "${env_args[@]}" '
+                '-e "PB_USE_PY3_11=$use_py3_11" -e "PB_MAKE_VENV=$make_venv" '
+                '-e "PB_DIAGNOSTIC_DEADLINE=$deadline_epoch" '
                 f"{shlex.quote(EXECUTION_FEEDBACK_IMAGE)} bash -lc "
-                f"{shlex.quote(container_command)}"
+                f"{shlex.quote(container_command)} >> \"$harness_log\" 2>&1; then"
             ),
-            f'docker cp {shlex.quote(SUBMISSION_DIR)}/. "$container_name:/submission"',
-            'docker start -a "$container_name"',
-        ]
-    )
-    script = "\n".join(
-        [
-            "set -u",
-            f"mkdir -p {shlex.quote(EXECUTION_FEEDBACK_DIR)}",
-            "set +e",
-            "diagnostic_script=" + shlex.quote(diagnostic_script),
+            f"    exit {EXECUTION_FEEDBACK_INFRASTRUCTURE_EXIT_CODE}",
+            "  fi",
             (
-                "timeout --signal=TERM --kill-after=30s "
-                f'{timeout_seconds}s bash -lc "$diagnostic_script" '
-                f"> {shlex.quote(log_path)} 2>&1"
+                f"  if ! docker cp {shlex.quote(SUBMISSION_DIR)}/. "
+                '"$container_name:/submission" >> "$harness_log" 2>&1; then'
             ),
-            "execution_status=$?",
-            f"docker rm -f {shlex.quote(container_name)} >/dev/null 2>&1 || true",
-            f"cat {shlex.quote(log_path)}",
-            'exit "$execution_status"',
+            '    docker rm -f "$container_name" >/dev/null 2>&1 || true',
+            f"    exit {EXECUTION_FEEDBACK_INFRASTRUCTURE_EXIT_CODE}",
+            "  fi",
+            (
+                f"  remaining=$((deadline_epoch - $(date +%s) - "
+                f"{EXECUTION_FEEDBACK_ARTIFACT_RESERVE_SECONDS}))"
+            ),
+            "  if (( remaining <= 0 )); then",
+            '    docker rm -f "$container_name" >/dev/null 2>&1 || true',
+            "    break",
+            "  fi",
+            '  docker start -a "$container_name" >> "$harness_log" 2>&1',
+            "  attempt_status=$?",
+            "  duration=$((SECONDS - started))",
+            '  durations+=("$duration")',
+            '  statuses+=("$attempt_status")',
+            "  attempt_count=$((attempt_count + 1))",
+            (
+                f"  if docker cp \"$container_name:{EXECUTION_FEEDBACK_INFRASTRUCTURE_MARKER}\" "
+                '"$harness_dir/infrastructure-error" >> "$harness_log" 2>&1; then'
+            ),
+            '    docker rm -f "$container_name" >/dev/null 2>&1 || true',
+            f"    exit {EXECUTION_FEEDBACK_INFRASTRUCTURE_EXIT_CODE}",
+            "  fi",
+            (
+                '  if ! docker cp "$container_name:/submission/reproduce.log" '
+                '"$attempt_dir/reproduce.log" >> "$harness_log" 2>&1; then'
+            ),
+            '    docker rm -f "$container_name" >/dev/null 2>&1 || true',
+            f"    exit {EXECUTION_FEEDBACK_INFRASTRUCTURE_EXIT_CODE}",
+            "  fi",
+            (
+                '  if ! docker cp "$container_name:/tmp/execution-feedback-artifacts.tar.gz" '
+                '"$attempt_dir/artifacts.tar.gz" >> "$harness_log" 2>&1; then'
+            ),
+            '    docker rm -f "$container_name" >/dev/null 2>&1 || true',
+            f"    exit {EXECUTION_FEEDBACK_INFRASTRUCTURE_EXIT_CODE}",
+            "  fi",
+            '  tar -xzf "$attempt_dir/artifacts.tar.gz" -C "$attempt_dir/artifacts"',
+            '  rm -f -- "$attempt_dir/artifacts.tar.gz"',
+            '  docker rm -f "$container_name" >/dev/null 2>&1 || true',
+            (
+                f"  if [[ \"$attempt_status\" == 124 || \"$attempt_status\" == 137 "
+                f"|| \"$duration\" -ge {EXECUTION_FEEDBACK_RETRY_THRESHOLD_SECONDS} ]]; then"
+            ),
+            "    terminal_attempt=$attempt_index",
+            "    break",
+            "  fi",
+            "done",
+            "if (( attempt_count == 0 )); then",
+            f"  exit {EXECUTION_FEEDBACK_INFRASTRUCTURE_EXIT_CODE}",
+            "fi",
+            "selected_attempt=$terminal_attempt",
+            "if (( selected_attempt < 0 )); then",
+            "  selected_attempt=0",
+            "  for ((index=1; index<attempt_count; index++)); do",
+            '    if (( durations[index] > durations[selected_attempt] )); then',
+            "      selected_attempt=$index",
+            "    fi",
+            "  done",
+            "fi",
+            "selected_number=$((selected_attempt + 1))",
+            (
+                'ln -s "attempts/attempt-$selected_number/reproduce.log" '
+                '"$feedback_dir/reproduce.log"'
+            ),
+            (
+                'ln -s "attempts/attempt-$selected_number/artifacts" '
+                '"$feedback_dir/artifacts"'
+            ),
+            'cat "$feedback_dir/reproduce.log"',
+            'exit "${statuses[selected_attempt]}"',
         ]
     )
-    return f"bash -lc {shlex.quote(script)}"
+    return f"bash -lc {shlex.quote(driver)}"
+
+
+def build_execution_feedback_command(*, iteration: int, timeout_seconds: int) -> str:
+    """Run formal-style salvage attempts in disposable reproduction containers."""
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+    return _build_execution_feedback_driver(iteration=iteration, timeout_seconds=timeout_seconds)
 
 
 def build_execution_feedback_prompt(
@@ -146,11 +384,15 @@ def build_execution_feedback_prompt(
         raise ValueError("reproduction_timeout_seconds must be positive")
     remaining_minutes = remaining_seconds // 60
     timeout_minutes = max(1, math.ceil(reproduction_timeout_seconds / 60))
+    artifacts_path = f"{log_path.rsplit('/', 1)[0]}/artifacts"
     return (
         f"You have {remaining_minutes} minutes remaining. The harness actually ran the "
-        "current submission's reproduce.sh in a clean reproduction environment for up "
+        "current submission's reproduce.sh using the production reproduction image, "
+        "environment variables, network access, and salvage variants for up "
         f"to {timeout_minutes} minutes. Its actual execution output is saved at "
-        f"{log_path}, and the run finished with exit status {reproduction_exit_code}. "
+        f"{log_path}; generated or changed files of at most 10 MiB are saved under "
+        f"{artifacts_path}. The selected attempt finished with exit status "
+        f"{reproduction_exit_code}. "
         "Use this result as evidence when reviewing the current submission, then "
         "continue the paper-replication task under the original instructions. Do not "
         "stop unless you have reproduced all core contributions of the paper. If they "
