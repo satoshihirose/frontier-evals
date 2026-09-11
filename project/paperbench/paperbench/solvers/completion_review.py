@@ -102,9 +102,10 @@ def remaining_budget_seconds(
 _COMPLETION_REVIEW_INSTRUCTION = (
     "Continue the current paper-replication task under the original instructions "
     "and use the remaining time to improve and verify your submission. Do not stop "
-    "unless you have reproduced all core contributions of the paper. If they are "
-    "already reproduced, verify the submission against the original instructions "
-    "and finish."
+    "until you have reproduced all results from the paper. Before finishing, ensure "
+    "the submission can reproduce all metrics, figures, tables, and findings from "
+    "the paper. If all results are already reproduced, verify the submission against "
+    "the original instructions and finish."
 )
 
 

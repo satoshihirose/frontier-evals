@@ -243,9 +243,11 @@ def test_completion_review_prompt_is_concise_and_reports_remaining_time() -> Non
     assert prompt == (
         "You have 31 minutes remaining. Continue the current paper-replication task "
         "under the original instructions and use the remaining time to improve and "
-        "verify your submission. Do not stop unless you have reproduced all core "
-        "contributions of the paper. If they are already reproduced, verify "
-        "the submission against the original instructions and finish."
+        "verify your submission. Do not stop until you have reproduced all results "
+        "from the paper. Before finishing, ensure the submission can reproduce all "
+        "metrics, figures, tables, and findings from the paper. If all results are "
+        "already reproduced, verify the submission against the original instructions "
+        "and finish."
     )
     assert DEFAULT_MIN_REMAINING_SECONDS == 3600
     assert remaining_budget_seconds(time_limit_seconds=7200, start_time=100, now=3700) == 3600
@@ -357,7 +359,8 @@ def test_execution_feedback_prompt_points_to_reproduction_evidence() -> None:
     assert "Review the execution log" in prompt
     assert prompt.endswith(common_instruction)
     assert "harness.log" not in prompt
-    assert "Do not stop unless you have reproduced all core contributions" in prompt
+    assert "Do not stop until you have reproduced all results from the paper" in prompt
+    assert "all metrics, figures, tables, and findings" in prompt
 
 
 def test_codex_review_resume_uses_exact_thread_and_remaining_budget() -> None:
