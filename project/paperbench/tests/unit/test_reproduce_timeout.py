@@ -1,9 +1,9 @@
 from pathlib import Path
 
 import pytest
+from paperbench.reproduce import run_reproduce_script
 
 from nanoeval.solvers.computer_tasks.code_execution_interface import ExecutionResult
-from paperbench.reproduce import run_reproduce_script
 
 
 class _FakeComputer:
@@ -36,4 +36,6 @@ async def test_timeout_is_enforced_inside_reproducer_before_returning() -> None:
 
     reproduce_command = computer.commands[1]
     assert "timeout --signal=TERM --kill-after=30s 5s bash -c" in reproduce_command
+    assert "set -o pipefail" in reproduce_command
     assert outcome.timedout is True
+    assert outcome.repro_exit_code == 124

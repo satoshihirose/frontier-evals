@@ -80,7 +80,7 @@ async def run_reproduce_script(
         cmd_str += " && update-alternatives --set python3 /usr/bin/python3.11"
     if make_venv:
         cmd_str += " && python3 -m venv venv && source venv/bin/activate"
-    cmd_str += " && bash reproduce.sh 2>&1 | tee reproduce.log'"
+    cmd_str += " && set -o pipefail && bash reproduce.sh 2>&1 | tee reproduce.log'"
 
     command_timeout = timeout
     if timeout is not None:
@@ -88,18 +88,18 @@ async def run_reproduce_script(
         # reaped before archiving. Cancelling only send_shell_command can leave `tee`
         # writing reproduce.log, which makes tar fail and prevents the salvage retry.
         timeout_seconds = f"{timeout:g}"
-        cmd_str = (
-            f"timeout --signal=TERM --kill-after=30s {timeout_seconds}s {cmd_str}"
-        )
+        cmd_str = f"timeout --signal=TERM --kill-after=30s {timeout_seconds}s {cmd_str}"
         command_timeout = timeout + 60
 
     repro_start_time = time.time()
     # run reproduce.sh with timeout
     timedout = False
+    repro_exit_code: int | None = None
     try:
         result = await asyncio.wait_for(
             computer.send_shell_command(cmd_str), timeout=command_timeout
         )
+        repro_exit_code = result.exit_code
         timedout = timeout is not None and result.exit_code in {124, 137}
         ctx_logger.info(f"Reproduction script output: {result.output.decode('utf-8')}")
     except asyncio.TimeoutError:
@@ -115,7 +115,12 @@ async def run_reproduce_script(
     else:
         repro_log = result.output.decode("utf-8")
 
-    return ReproScriptRunOutcome(repro_execution_time, timedout, repro_log)
+    return ReproScriptRunOutcome(
+        repro_execution_time,
+        timedout,
+        repro_log,
+        repro_exit_code,
+    )
 
 
 async def reproduce(
@@ -166,6 +171,7 @@ async def reproduce(
             files_before_reproduce=files_before_reproduce,
             files_after_reproduce=files_before_reproduce,
             timedout=False,
+            repro_exit_code=127,
         )
 
     # sometimes git complains about `detected dubious ownership in repository` due to mismatching file ownership
@@ -199,6 +205,7 @@ async def reproduce(
         files_after_reproduce=files_after_reproduce,
         git_status_after_reproduce=git_status,
         timedout=repro_outcome.timedout,
+        repro_exit_code=repro_outcome.repro_exit_code,
         # will populate retried_results and executed_submission later
     )
 
@@ -268,9 +275,7 @@ async def reproduce_on_computer(
         # paths so the final selector can promote an earlier attempt without rerunning it.
         attempt_suffix = "" if attempt_index is None else f"_attempt_{attempt_index}"
         upload_from = output_cluster_path / "submission_executed.tar.gz"
-        upload_to = submission_path.replace(
-            ".tar.gz", f"_executed{attempt_suffix}.tar.gz"
-        )
+        upload_to = submission_path.replace(".tar.gz", f"_executed{attempt_suffix}.tar.gz")
         await tar_and_extract_from_computer(
             computer=computer,
             dir_path_on_computer=submission_cluster_path,
@@ -319,9 +324,7 @@ async def reproduce_on_computer_with_salvaging(
     retries_enabled = retry_threshold > 0 and valid_threshold
 
     retry_options = (
-        REPRODUCTION_SALVAGE_ATTEMPTS
-        if retries_enabled
-        else REPRODUCTION_SALVAGE_ATTEMPTS[:1]
+        REPRODUCTION_SALVAGE_ATTEMPTS if retries_enabled else REPRODUCTION_SALVAGE_ATTEMPTS[:1]
     )
 
     repro_attempts: list[ReproductionMetadata] = []
@@ -332,8 +335,7 @@ async def reproduce_on_computer_with_salvaging(
 
     for attempt_index, opts in enumerate(retry_options):
         ctx_logger.info(
-            f"Executing reproduce.sh with py3_11={opts.use_py3_11}"
-            f" and make_venv={opts.make_venv}"
+            f"Executing reproduce.sh with py3_11={opts.use_py3_11} and make_venv={opts.make_venv}"
         )
         repro_attempt = await reproduce_on_computer(
             computer_runtime=computer_runtime,
@@ -353,33 +355,33 @@ async def reproduce_on_computer_with_salvaging(
         )
         repro_attempts.append(repro_attempt)
         if _should_retry(retries_enabled, repro_attempt, retry_threshold):
+            retry_reason = (
+                f"ended before {retry_threshold} seconds"
+                if _attempt_succeeded(repro_attempt)
+                else f"failed with exit code {repro_attempt.repro_exit_code}"
+            )
             ctx_logger.info(
-                f"Reproduction attempt ended before {retry_threshold} seconds,"
-                " retrying with different configuration."
+                f"Reproduction attempt {retry_reason}; retrying with different configuration."
             )
             continue  # retry, with next configuration
         else:
             break  # this last attempt was it
 
-    selected_index = len(repro_attempts) - 1
-    if retries_enabled and all(
-        _should_retry(True, attempt, retry_threshold) for attempt in repro_attempts
-    ):
-        # The original PaperBench heuristic treats a longer run as less likely to be an
-        # early exit. If no attempt reaches the threshold, the final attempt has no
-        # special claim to validity, so selecting the longest one preserves that
-        # heuristic while avoiding an arbitrary last-attempt overwrite.
-        selected_index = max(
-            range(len(repro_attempts)),
-            key=lambda index: (
-                repro_attempts[index].repro_execution_time or 0,
-                -index,
-            ),
-        )
-        ctx_logger.info(
-            "No reproduction attempt reached the retry threshold; selecting the "
-            f"longest attempt ({selected_index})."
-        )
+    successful_indices = [
+        index for index, attempt in enumerate(repro_attempts) if _attempt_succeeded(attempt)
+    ]
+    selection_pool = successful_indices or list(range(len(repro_attempts)))
+    selected_index = max(
+        selection_pool,
+        key=lambda index: (
+            repro_attempts[index].repro_execution_time or 0,
+            -index,
+        ),
+    )
+    selection_reason = "successful" if successful_indices else "failed fallback"
+    ctx_logger.info(
+        f"Selecting longest {selection_reason} reproduction attempt ({selected_index})."
+    )
 
     repro_metadata = repro_attempts[selected_index]
     canonical_submission = submission_path.replace(".tar.gz", "_executed.tar.gz")
@@ -409,9 +411,17 @@ async def reproduce_on_computer_with_salvaging(
 def _should_retry(
     retries_enabled: bool, repro_attempt: ReproductionMetadata, retry_threshold: float
 ) -> bool:
-    """Retry only early exits; a timeout has already consumed the full run budget."""
+    """Retry failed or short attempts, except a timeout that consumed the full budget."""
     execution_time = repro_attempt.repro_execution_time or 0
-    return retries_enabled and not repro_attempt.timedout and execution_time < retry_threshold
+    return (
+        retries_enabled
+        and not repro_attempt.timedout
+        and (not _attempt_succeeded(repro_attempt) or execution_time < retry_threshold)
+    )
+
+
+def _attempt_succeeded(repro_attempt: ReproductionMetadata) -> bool:
+    return not repro_attempt.timedout and repro_attempt.repro_exit_code == 0
 
 
 def _populate_retried_results(
@@ -420,7 +430,12 @@ def _populate_retried_results(
     """Populates a ReproductionMetadata.retried_results with info from previous attempts"""
     if len(repro_attempts) >= 1:
         retried = [
-            ReproScriptRunOutcome(float(m.repro_execution_time or 0), m.timedout, m.repro_log)
+            ReproScriptRunOutcome(
+                float(m.repro_execution_time or 0),
+                m.timedout,
+                m.repro_log,
+                m.repro_exit_code,
+            )
             for m in repro_attempts
         ]
         repro_metadata = replace(repro_metadata, retried_results=retried)

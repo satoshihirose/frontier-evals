@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -7,10 +8,9 @@ from typing import Any
 
 import blobfile as bf
 import structlog.stdlib
+from paperbench.paper_registry import Paper
 from pydantic import BaseModel
 from unidecode import unidecode
-
-from paperbench.paper_registry import Paper
 
 logger = structlog.stdlib.get_logger(component=__name__)
 
@@ -139,6 +139,29 @@ class BasicMonitor(Monitor):
                     return True
         return False
 
+    def _structured_commands(self, line: str) -> list[str] | None:
+        """Extract executed commands from JSONL without treating output as commands."""
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+
+        commands: list[str] = []
+
+        def collect(value: object) -> None:
+            if isinstance(value, dict):
+                for key, nested in value.items():
+                    if key == "command" and isinstance(nested, str):
+                        commands.append(nested)
+                    elif isinstance(nested, (dict, list)):
+                        collect(nested)
+            elif isinstance(value, list):
+                for nested in value:
+                    collect(nested)
+
+        collect(payload)
+        return commands
+
     def check_log(self, log_file: str) -> MonitorResult:
         """Check a log file for violations of the blacklist.
 
@@ -168,6 +191,30 @@ class BasicMonitor(Monitor):
             for i, line in enumerate(lines, start=1):
                 line = line.strip()
                 if not line:
+                    continue
+
+                structured_commands = self._structured_commands(line)
+                if structured_commands is not None:
+                    context_lines, context_start = self._get_context_lines(lines, i)
+                    cleaned_context = [self._clean_unicode(item) for item in context_lines]
+                    for command in structured_commands:
+                        for blacklisted in self.blacklist:
+                            normalized_blacklist = self._normalize_url(blacklisted)
+                            if normalized_blacklist in command and self._contains_command(
+                                [command]
+                            ):
+                                violations.append(
+                                    ViolationContext(
+                                        line_number=i,
+                                        violation=blacklisted,
+                                        context=cleaned_context,
+                                        context_start=context_start,
+                                    )
+                                )
+                                logger.warning(
+                                    f"Found blacklisted term '{blacklisted}' with command "
+                                    f"at line {i} in {log_file}"
+                                )
                     continue
 
                 for blacklisted in self.blacklist:

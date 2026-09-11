@@ -12,6 +12,8 @@ from alcatraz.clusters.interface import AlcatrazException
 load_dotenv()
 import structlog.stdlib
 from nanoeval_alcatraz.alcatraz_computer_interface import AlcatrazComputerRuntime
+from paperbench.grade import JudgeOutput
+from paperbench.monitor.monitor import MonitorResult
 from preparedness_turn_completer.oai_completions_turn_completer import (
     OpenAICompletionsTurnCompleter,
 )
@@ -25,8 +27,6 @@ from nanoeval.solvers.computer_tasks.code_execution_interface import (
     RuntimeConfig,
 )
 from nanoeval.solvers.computer_tasks.task import Grade
-from paperbench.grade import JudgeOutput
-from paperbench.monitor.monitor import MonitorResult
 
 GRADER_OPENAI_API_KEY = os.getenv("GRADER_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
 
@@ -42,6 +42,7 @@ class ReproductionMetadata:
     files_after_reproduce: str
     timedout: bool
     repro_log: str
+    repro_exit_code: int | None = None
     retried_results: list[ReproScriptRunOutcome] = field(default_factory=list)
     repro_execution_time: float | None = None
     git_status_after_reproduce: str | None = None
@@ -60,6 +61,7 @@ class ReproductionMetadata:
                 files_after_reproduce=data["files_after_reproduce"],
                 timedout=data["timedout"],
                 repro_log=data["repro_log"],
+                repro_exit_code=data.get("repro_exit_code"),
                 retried_results=retried_results,
                 repro_execution_time=data["repro_execution_time"],
                 git_status_after_reproduce=data["git_status_after_reproduce"],
@@ -77,6 +79,7 @@ class ReproScriptRunOutcome:
     repro_execution_time: float
     timedout: bool
     repro_log: str
+    repro_exit_code: int | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ReproScriptRunOutcome:
@@ -85,6 +88,7 @@ class ReproScriptRunOutcome:
                 repro_execution_time=data["repro_execution_time"],
                 timedout=data["timedout"],
                 repro_log=data["repro_log"],
+                repro_exit_code=data.get("repro_exit_code"),
             )
         except KeyError as e:
             raise ValueError("Missing required field in reproduction script run outcome") from e

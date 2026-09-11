@@ -319,8 +319,9 @@ class Limits(TypedDict):
 
 
 DEFAULT_LIMITS: Limits = {
-    # We effectively don't limit the Docker client timeout. Set it to one day.
-    "docker_client_timeout_seconds": 24 * 60 * 60,
+    # Keep the Docker RPC timeout above PaperBench's 24-hour reproduction limit so
+    # PaperBench can stop the script and archive the partial submission first.
+    "docker_client_timeout_seconds": 25 * 60 * 60,
     "image_pull_timeout_seconds": 5 * 60,
     "initialization_concurrency": 128,
 }
