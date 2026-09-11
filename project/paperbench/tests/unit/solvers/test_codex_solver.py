@@ -245,7 +245,7 @@ def test_completion_review_prompt_is_concise_and_reports_remaining_time() -> Non
         "under the original instructions and use the remaining time to improve and "
         "verify your submission. Do not stop unless you have reproduced all core "
         "contributions of the paper. If they are already reproduced, verify "
-        "reproduce.sh end to end and finish."
+        "the submission against the original instructions and finish."
     )
     assert DEFAULT_MIN_REMAINING_SECONDS == 3600
     assert remaining_budget_seconds(time_limit_seconds=7200, start_time=100, now=3700) == 3600
@@ -342,18 +342,20 @@ def test_execution_feedback_prompt_points_to_reproduction_evidence() -> None:
     prompt = build_execution_feedback_prompt(
         remaining_seconds=3600,
         log_path="/home/logs/execution-feedback/iteration-1/reproduce.log",
-        reproduction_exit_code=1,
         reproduction_timeout_seconds=1800,
     )
 
-    assert "60 minutes remaining" in prompt
+    generic_prompt = build_completion_review_prompt(3600)
+    common_instruction = generic_prompt.removeprefix("You have 60 minutes remaining. ")
+
+    assert prompt.startswith("You have 60 minutes remaining. ")
     assert "/home/logs/execution-feedback/iteration-1/reproduce.log" in prompt
     assert "/home/logs/execution-feedback/iteration-1/artifacts" in prompt
-    assert "exit status 1" in prompt
+    assert "exit status" not in prompt
     assert "up to 30 minutes" in prompt
-    assert "production reproduction image" in prompt
-    assert "environment variables, network access, and salvage variants" in prompt
-    assert "actual execution output" in prompt
+    assert "A diagnostic reproduction was run" in prompt
+    assert "Review the execution log" in prompt
+    assert prompt.endswith(common_instruction)
     assert "harness.log" not in prompt
     assert "Do not stop unless you have reproduced all core contributions" in prompt
 

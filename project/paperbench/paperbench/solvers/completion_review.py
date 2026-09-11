@@ -99,17 +99,20 @@ def remaining_budget_seconds(
     return max(0, math.floor(time_limit_seconds - (now - start_time)))
 
 
+_COMPLETION_REVIEW_INSTRUCTION = (
+    "Continue the current paper-replication task under the original instructions "
+    "and use the remaining time to improve and verify your submission. Do not stop "
+    "unless you have reproduced all core contributions of the paper. If they are "
+    "already reproduced, verify the submission against the original instructions "
+    "and finish."
+)
+
+
 def build_completion_review_prompt(remaining_seconds: int) -> str:
     if remaining_seconds < 0:
         raise ValueError("remaining_seconds must be non-negative")
     remaining_minutes = remaining_seconds // 60
-    return (
-        f"You have {remaining_minutes} minutes remaining. Continue the current "
-        "paper-replication task under the original instructions and use the remaining "
-        "time to improve and verify your submission. Do not stop unless you have "
-        "reproduced all core contributions of the paper. If they are already "
-        "reproduced, verify reproduce.sh end to end and finish."
-    )
+    return f"You have {remaining_minutes} minutes remaining. {_COMPLETION_REVIEW_INSTRUCTION}"
 
 
 def execution_feedback_timeout_seconds(
@@ -375,7 +378,6 @@ def build_execution_feedback_prompt(
     *,
     remaining_seconds: int,
     log_path: str,
-    reproduction_exit_code: int,
     reproduction_timeout_seconds: int,
 ) -> str:
     if remaining_seconds < 0:
@@ -386,17 +388,10 @@ def build_execution_feedback_prompt(
     timeout_minutes = max(1, math.ceil(reproduction_timeout_seconds / 60))
     artifacts_path = f"{log_path.rsplit('/', 1)[0]}/artifacts"
     return (
-        f"You have {remaining_minutes} minutes remaining. The harness actually ran the "
-        "current submission's reproduce.sh using the production reproduction image, "
-        "environment variables, network access, and salvage variants for up "
-        f"to {timeout_minutes} minutes. Its actual execution output is saved at "
-        f"{log_path}; generated or changed files of at most 10 MiB are saved under "
-        f"{artifacts_path}. The selected attempt finished with exit status "
-        f"{reproduction_exit_code}. "
-        "Use this result as evidence when reviewing the current submission, then "
-        "continue the paper-replication task under the original instructions. Do not "
-        "stop unless you have reproduced all core contributions of the paper. If they "
-        "are already reproduced, verify reproduce.sh end to end and finish."
+        f"You have {remaining_minutes} minutes remaining. A diagnostic reproduction "
+        f"was run for up to {timeout_minutes} minutes. Review the execution log at "
+        f"{log_path} and any relevant generated artifacts under {artifacts_path}. "
+        f"{_COMPLETION_REVIEW_INSTRUCTION}"
     )
 
 

@@ -730,7 +730,6 @@ class CodexSolver(BasePBSolver):
                 first_fork_prompt = build_execution_feedback_prompt(
                     remaining_seconds=remaining_seconds,
                     log_path=feedback_log_path,
-                    reproduction_exit_code=feedback_result.exit_code,
                     reproduction_timeout_seconds=diagnostic_timeout,
                 )
             else:
@@ -996,7 +995,6 @@ class CodexSolver(BasePBSolver):
                             review_prompt = build_execution_feedback_prompt(
                                 remaining_seconds=remaining_seconds,
                                 log_path=feedback_log_path,
-                                reproduction_exit_code=feedback_exit_code,
                                 reproduction_timeout_seconds=diagnostic_timeout,
                             )
                         else:
