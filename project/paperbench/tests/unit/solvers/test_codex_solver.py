@@ -86,6 +86,7 @@ class FakeComputer(ComputerInterface):
         self.fork_checkpoint = fork_checkpoint
         self.commands: list[str] = []
         self.uploads: dict[str, bytes] = {}
+        self.downloads: list[str] = []
         self.download_count = 0
         self.refreshed_auth = b'{"tokens": {"access_token": "refreshed"}}\n'
 
@@ -96,6 +97,7 @@ class FakeComputer(ComputerInterface):
         self.uploads[destination] = file
 
     async def download(self, file: str) -> bytes:
+        self.downloads.append(file)
         if file == CODEX_AUTH_PATH:
             return self.refreshed_auth
         if file == CODEX_FORK_CHECKPOINT_CONTAINER_PATH:
@@ -935,3 +937,23 @@ async def test_codex_solver_checkpoints_submission_during_long_rollout(
     assert checkpoints
     assert all(runtime is not None and runtime > 0 for runtime in checkpoints)
     assert computer.download_count > 1
+
+
+@pytest.mark.asyncio
+async def test_codex_solver_checkpoints_the_active_review_event_log(
+    tmp_path: Path,
+) -> None:
+    task = make_task(tmp_path)
+    computer = FakeComputer(command_delay=0.03)
+    solver = CodexSolver(time_limit=60, upload_interval_seconds=0.005)
+
+    await solver._execute_with_checkpoints(
+        computer=computer,
+        task=task,
+        command="codex exec fork > /home/logs/codex-review-events.jsonl",
+        start_time=0,
+        event_log_path=CODEX_REVIEW_EVENT_LOG,
+    )
+
+    assert CODEX_REVIEW_EVENT_LOG in computer.downloads
+    assert CODEX_EVENT_LOG not in computer.downloads

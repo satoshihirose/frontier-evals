@@ -594,6 +594,7 @@ class CodexSolver(BasePBSolver):
         task: PBTask,
         command: str,
         start_time: float,
+        event_log_path: str = CODEX_EVENT_LOG,
     ) -> ExecutionResult:
         if self.upload_interval_seconds is not None and self.upload_interval_seconds <= 0:
             raise ValueError("upload_interval_seconds must be positive or null")
@@ -625,7 +626,11 @@ class CodexSolver(BasePBSolver):
                         run_dir=task.run_dir,
                         status="running",
                     )
-                    checkpoint_log = await self._read_event_log(computer, b"")
+                    checkpoint_log = await self._read_event_log(
+                        computer,
+                        b"",
+                        event_log_path,
+                    )
                     self._write_run_logs(task, checkpoint_log)
                 except Exception as exc:
                     logger.exception(
@@ -763,6 +768,9 @@ class CodexSolver(BasePBSolver):
                 task=task,
                 command=command,
                 start_time=start_time,
+                event_log_path=(
+                    CODEX_REVIEW_EVENT_LOG if is_fork_branch else CODEX_EVENT_LOG
+                ),
             )
             exit_code = result.exit_code
             command_output = result.output
@@ -1015,6 +1023,7 @@ class CodexSolver(BasePBSolver):
                                 task=task,
                                 command=review_command,
                                 start_time=start_time,
+                                event_log_path=CODEX_REVIEW_EVENT_LOG,
                             )
                             review_log = await self._read_event_log(
                                 computer,
