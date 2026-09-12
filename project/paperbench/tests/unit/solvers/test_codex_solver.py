@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -52,6 +53,7 @@ from paperbench.solvers.completion_review import (
     _COPY_CHANGED_ARTIFACTS_SCRIPT,
     _SNAPSHOT_SCRIPT,
     DEFAULT_MIN_REMAINING_SECONDS,
+    EXECUTION_FEEDBACK_INPUT_VERSION,
     EXECUTION_FEEDBACK_MAX_ARTIFACT_BYTES,
     build_completion_review_prompt,
     build_execution_feedback_command,
@@ -296,6 +298,12 @@ def test_execution_feedback_matches_formal_reproduction_contract() -> None:
     assert "harness.log" in command
     assert "artifacts" in command
     assert "artifact-manifest" not in command
+    assert 'attempts_dir="$harness_dir/attempts"' in command
+    assert 'mkdir -p "$feedback_dir" "$attempts_dir"' in command
+    assert 'rm -rf -- "$harness_dir"' in command
+    assert '"$attempt_status" == 0' in command
+    assert 'statuses[index] == 0' in command
+    assert 'ln -s "attempts/' not in command
 
 
 def test_execution_feedback_copies_only_small_created_or_changed_files(tmp_path: Path) -> None:
@@ -304,8 +312,14 @@ def test_execution_feedback_copies_only_small_created_or_changed_files(tmp_path:
     snapshot = tmp_path / "before.json"
     submission.mkdir()
     (submission / "unchanged.txt").write_text("same")
+    (submission / "regenerated.txt").write_text("same output")
     (submission / "changed.txt").write_text("before")
     (submission / "link").symlink_to("unchanged.txt")
+    for excluded_dir in ("venv", ".venv", ".git", "__pycache__", ".cache", "node_modules"):
+        path = submission / excluded_dir
+        path.mkdir()
+        (path / "ignored.txt").write_text("before")
+    (submission / "ignored.pyc").write_text("before")
 
     subprocess.run(
         [
@@ -318,11 +332,19 @@ def test_execution_feedback_copies_only_small_created_or_changed_files(tmp_path:
         ],
         check=True,
     )
+    regenerated = submission / "regenerated.txt"
+    regenerated_stat = regenerated.stat()
+    regenerated.write_text("same output")
+    os.utime(
+        regenerated,
+        ns=(regenerated_stat.st_atime_ns, regenerated_stat.st_mtime_ns + 1_000_000_000),
+    )
     (submission / "changed.txt").write_text("after")
     (submission / "new.txt").write_text("new")
-    (submission / "too-large.bin").write_bytes(
-        b"x" * (EXECUTION_FEEDBACK_MAX_ARTIFACT_BYTES + 1)
-    )
+    for excluded_dir in ("venv", ".venv", ".git", "__pycache__", ".cache", "node_modules"):
+        (submission / excluded_dir / "ignored.txt").write_text("after")
+    (submission / "ignored.pyc").write_text("after")
+    (submission / "too-large.bin").write_bytes(b"x" * (EXECUTION_FEEDBACK_MAX_ARTIFACT_BYTES + 1))
     (submission / "reproduce.log").write_text("diagnostic log")
 
     subprocess.run(
@@ -339,7 +361,11 @@ def test_execution_feedback_copies_only_small_created_or_changed_files(tmp_path:
     )
 
     copied = sorted(path.relative_to(destination).as_posix() for path in destination.rglob("*"))
-    assert copied == ["changed.txt", "new.txt"]
+    assert copied == ["changed.txt", "new.txt", "regenerated.txt"]
+
+
+def test_execution_feedback_version_is_explicit() -> None:
+    assert EXECUTION_FEEDBACK_INPUT_VERSION == 2
 
 
 def test_execution_feedback_prompt_points_to_reproduction_evidence() -> None:
@@ -450,6 +476,45 @@ async def test_codex_parent_saves_a_non_secret_fork_checkpoint(
 
 
 @pytest.mark.asyncio
+async def test_codex_parent_records_exhausted_budget_without_saving_a_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = make_task(tmp_path)
+    source_submission = str(tmp_path / "initial-submission.tar.gz")
+    Path(source_submission).write_bytes(b"submission")
+    monkeypatch.setattr(
+        codex_solver_module,
+        "snapshot_initial_submission",
+        lambda _: source_submission,
+    )
+    monkeypatch.setattr(
+        codex_solver_module,
+        "remaining_budget_seconds",
+        lambda **_: 0,
+    )
+    computer = FakeComputer(
+        event_log=b'{"type":"thread.started","thread_id":"parent-123"}\n',
+    )
+    solver = CodexSolver(save_fork_checkpoint=True)
+
+    async def timed_out_rollout(self: CodexSolver, **_: object) -> ExecutionResult:
+        return ExecutionResult(output=b"", exit_code=124)
+
+    monkeypatch.setattr(CodexSolver, "_execute_with_checkpoints", timed_out_rollout)
+
+    output = await solver._run_agent(computer, task)
+
+    assert output.error_msg == "Codex rollout timed out after 86400 seconds"
+    metadata = json.loads((Path(task.run_dir) / "codex-fork-checkpoint.json").read_text())
+    assert metadata["status"] == "skipped-insufficient-original-budget"
+    assert metadata["remaining_seconds"] == 0
+    assert metadata["source_submission"] == source_submission
+    assert metadata["session_checkpoint"] == ""
+    assert CODEX_FORK_CHECKPOINT_CONTAINER_PATH not in computer.downloads
+
+
+@pytest.mark.asyncio
 async def test_codex_child_forks_from_the_saved_parent_checkpoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -487,6 +552,52 @@ async def test_codex_child_forks_from_the_saved_parent_checkpoint(
     assert completion["performed"] is True
     assert completion["review_count"] == 1
     assert completion["iterations"][0]["operation"] == "fork"
+
+
+@pytest.mark.asyncio
+async def test_codex_child_marks_timed_out_fork_review_as_performed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = make_task(tmp_path)
+    session_checkpoint = tmp_path / "session.tar.gz"
+    source_submission = tmp_path / "submission.tar.gz"
+    session_checkpoint.write_bytes(b"session")
+    source_submission.write_bytes(b"submission")
+    computer = FakeComputer(
+        review_event_log=b'\n'.join(
+            [
+                b'{"type":"thread.started","thread_id":"branch-456"}',
+                b'{"type":"item.completed","item":{"type":"agent_message"}}',
+            ]
+        ),
+    )
+    remaining = iter([4000, 0])
+    monkeypatch.setattr(
+        codex_solver_module,
+        "remaining_budget_seconds",
+        lambda **_: next(remaining),
+    )
+
+    async def timed_out_rollout(self: CodexSolver, **_: object) -> ExecutionResult:
+        return ExecutionResult(output=b"", exit_code=124)
+
+    monkeypatch.setattr(CodexSolver, "_execute_with_checkpoints", timed_out_rollout)
+
+    output = await CodexSolver(
+        time_limit=7200,
+        completion_review=True,
+        fork_parent_thread_id="parent-123",
+        fork_session_checkpoint_path=str(session_checkpoint),
+        fork_source_submission_path=str(source_submission),
+    )._run_agent(computer, task)
+
+    assert output.error_msg == "Codex rollout timed out after 7200 seconds"
+    completion = json.loads((Path(task.run_dir) / "completion-review.json").read_text())
+    assert completion["performed"] is True
+    assert completion["review_count"] == 1
+    assert completion["iterations"][0]["exit_code"] == 124
+    assert completion["completion_reason"] == "review-exit-nonzero"
 
 
 @pytest.mark.asyncio
@@ -836,8 +947,10 @@ async def test_codex_solver_counts_execution_feedback_against_shared_budget(
     assert "/home/logs/execution-feedback/iteration-1/reproduce.log" in review_commands[0]
     completion = json.loads((Path(task.run_dir) / "completion-review.json").read_text())
     assert completion["mode"] == "execution-log"
+    assert completion["execution_feedback_input_version"] == 2
     assert completion["budget_policy"] == "shared-agent-and-diagnostic-wall-clock"
     assert completion["review_count"] == 1
+    assert completion["iterations"][0]["execution_feedback"]["input_version"] == 2
     assert completion["iterations"][0]["execution_feedback"]["timeout_seconds"] == 3540
     assert completion["completion_reason"] == "insufficient-original-budget"
 

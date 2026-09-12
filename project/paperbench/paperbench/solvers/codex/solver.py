@@ -33,6 +33,7 @@ from paperbench.solvers.basicagent.utils import (
 )
 from paperbench.solvers.completion_review import (
     DEFAULT_MIN_REMAINING_SECONDS,
+    EXECUTION_FEEDBACK_INPUT_VERSION,
     MAX_CONSECUTIVE_QUICK_UNCHANGED,
     QUICK_UNCHANGED_MAX_SECONDS,
     CompletionReviewMode,
@@ -587,6 +588,31 @@ class CodexSolver(BasePBSolver):
         )
         return metadata
 
+    @staticmethod
+    def _write_exhausted_fork_metadata(
+        *,
+        task: PBTask,
+        parent_thread_id: str | None,
+        source_submission: str,
+        remaining_seconds: int,
+    ) -> dict[str, object]:
+        """Record a deliberate no-review branch without archiving a session."""
+        metadata: dict[str, object] = {
+            "schema_version": 1,
+            "status": "skipped-insufficient-original-budget",
+            "parent_thread_id": parent_thread_id or "",
+            "session_checkpoint": "",
+            "source_submission": source_submission,
+            "remaining_seconds": remaining_seconds,
+            "auth_included": False,
+            "created_at": time.time(),
+        }
+        bf.write_bytes(
+            bf.join(task.run_dir, CODEX_FORK_METADATA_FILENAME),
+            (json.dumps(metadata, indent=2, sort_keys=True) + "\n").encode(),
+        )
+        return metadata
+
     async def _execute_with_checkpoints(
         self,
         *,
@@ -716,6 +742,7 @@ class CodexSolver(BasePBSolver):
                 if is_execution_feedback_infrastructure_error(feedback_result.exit_code):
                     raise RuntimeError("Execution-feedback reproduction infrastructure failed")
                 first_fork_feedback = {
+                    "input_version": EXECUTION_FEEDBACK_INPUT_VERSION,
                     "timeout_seconds": diagnostic_timeout,
                     "log_path": feedback_log_path,
                     "started_at": feedback_started_at,
@@ -768,9 +795,7 @@ class CodexSolver(BasePBSolver):
                 task=task,
                 command=command,
                 start_time=start_time,
-                event_log_path=(
-                    CODEX_REVIEW_EVENT_LOG if is_fork_branch else CODEX_EVENT_LOG
-                ),
+                event_log_path=(CODEX_REVIEW_EVENT_LOG if is_fork_branch else CODEX_EVENT_LOG),
             )
             exit_code = result.exit_code
             command_output = result.output
@@ -793,26 +818,44 @@ class CodexSolver(BasePBSolver):
             error_msg = "Codex fork did not emit a branch thread id"
         initial_exit_code = exit_code
         fork_checkpoint_metadata: dict[str, object] | None = None
-        if self.save_fork_checkpoint and exit_code == 0:
+        if self.save_fork_checkpoint:
+            fork_remaining_seconds = remaining_budget_seconds(
+                time_limit_seconds=self.time_limit,
+                start_time=start_time,
+                now=time.time(),
+            )
             parent_thread_id = extract_codex_thread_id(event_log)
-            if parent_thread_id is None:
-                exit_code = 1
-                error_msg = "Codex parent rollout did not emit a thread id"
-            else:
-                await upload_heavy_logs(
-                    computer=computer,
-                    agent_start_time=int(start_time),
-                    agent_dir_config=AGENT_DIR_CONFIG,
-                    run_dir=task.run_dir,
-                    run_group_id=task.run_group_id,
-                    runs_dir=task.runs_dir,
-                    run_id=task.run_id,
-                    runtime=time.time() - start_time,
-                )
-                source_submission = snapshot_initial_submission(task.run_dir)
-                if source_submission is None:
+            should_inherit_without_review = (
+                fork_remaining_seconds < self.completion_review_min_remaining_seconds
+            )
+            if exit_code == 0 or should_inherit_without_review:
+                if parent_thread_id is None and not should_inherit_without_review:
                     exit_code = 1
-                    error_msg = "Codex parent rollout did not produce a submission"
+                    error_msg = "Codex parent rollout did not emit a thread id"
+                    source_submission = None
+                else:
+                    await upload_heavy_logs(
+                        computer=computer,
+                        agent_start_time=int(start_time),
+                        agent_dir_config=AGENT_DIR_CONFIG,
+                        run_dir=task.run_dir,
+                        run_group_id=task.run_group_id,
+                        runs_dir=task.runs_dir,
+                        run_id=task.run_id,
+                        runtime=time.time() - start_time,
+                    )
+                    source_submission = snapshot_initial_submission(task.run_dir)
+                if source_submission is None:
+                    if exit_code == 0:
+                        exit_code = 1
+                        error_msg = "Codex parent rollout did not produce a submission"
+                elif should_inherit_without_review:
+                    fork_checkpoint_metadata = self._write_exhausted_fork_metadata(
+                        task=task,
+                        parent_thread_id=parent_thread_id,
+                        source_submission=source_submission,
+                        remaining_seconds=fork_remaining_seconds,
+                    )
                 else:
                     try:
                         fork_checkpoint_metadata = await self._save_fork_checkpoint(
@@ -820,11 +863,7 @@ class CodexSolver(BasePBSolver):
                             task=task,
                             parent_thread_id=parent_thread_id,
                             source_submission=source_submission,
-                            remaining_seconds=remaining_budget_seconds(
-                                time_limit_seconds=self.time_limit,
-                                start_time=start_time,
-                                now=time.time(),
-                            ),
+                            remaining_seconds=fork_remaining_seconds,
                         )
                     except Exception as exc:
                         exit_code = 1
@@ -844,7 +883,14 @@ class CodexSolver(BasePBSolver):
             "max_consecutive_quick_unchanged": MAX_CONSECUTIVE_QUICK_UNCHANGED,
             "forked_from_id": self.fork_parent_thread_id,
         }
-        if self.completion_review and exit_code == 0:
+        if self.completion_review_mode == "execution-log":
+            completion_review_metadata["execution_feedback_input_version"] = (
+                EXECUTION_FEEDBACK_INPUT_VERSION
+            )
+        record_completion_review = exit_code == 0 or (
+            is_fork_branch and exit_code == 124
+        )
+        if self.completion_review and record_completion_review:
             remaining_seconds = remaining_budget_seconds(
                 time_limit_seconds=self.time_limit,
                 start_time=start_time,
@@ -901,7 +947,9 @@ class CodexSolver(BasePBSolver):
                         "consecutive_quick_unchanged": (seed_consecutive_quick_unchanged),
                     }
                 )
-            if remaining_seconds < self.completion_review_min_remaining_seconds:
+            if is_fork_branch and exit_code != 0:
+                completion_review_metadata["completion_reason"] = "review-exit-nonzero"
+            elif remaining_seconds < self.completion_review_min_remaining_seconds:
                 if is_fork_branch:
                     completion_review_metadata["completion_reason"] = "insufficient-original-budget"
                 else:
@@ -972,6 +1020,7 @@ class CodexSolver(BasePBSolver):
                                 logger.exception(error_msg)
                             feedback_finished_at = time.time()
                             execution_feedback = {
+                                "input_version": EXECUTION_FEEDBACK_INPUT_VERSION,
                                 "timeout_seconds": diagnostic_timeout,
                                 "log_path": feedback_log_path,
                                 "started_at": feedback_started_at,

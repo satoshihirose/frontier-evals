@@ -27,6 +27,7 @@ EXECUTION_FEEDBACK_NETWORK = "bridge"
 EXECUTION_FEEDBACK_RETRY_THRESHOLD_SECONDS = 600
 EXECUTION_FEEDBACK_ARTIFACT_RESERVE_SECONDS = 30
 EXECUTION_FEEDBACK_MAX_ARTIFACT_BYTES = 10 * 1024 * 1024
+EXECUTION_FEEDBACK_INPUT_VERSION = 2
 EXECUTION_FEEDBACK_INFRASTRUCTURE_EXIT_CODE = 125
 EXECUTION_FEEDBACK_INFRASTRUCTURE_MARKER = "/tmp/execution-feedback-infrastructure-error"
 CompletionReviewMode = Literal["generic", "execution-log"]
@@ -39,13 +40,23 @@ import stat
 import sys
 
 root, output, max_size = sys.argv[1], sys.argv[2], int(sys.argv[3])
+excluded_directories = {
+    ".cache",
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".venv",
+    "__pycache__",
+    "node_modules",
+    "venv",
+}
 snapshot = {}
 for current, directories, files in os.walk(root, followlinks=False):
-    directories[:] = sorted(directories)
+    directories[:] = sorted(name for name in directories if name not in excluded_directories)
     for name in sorted(files):
         path = os.path.join(current, name)
         info = os.lstat(path)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > max_size:
+        if name.endswith(".pyc") or not stat.S_ISREG(info.st_mode) or info.st_size > max_size:
             continue
         relative = os.path.relpath(path, root)
         if relative in {"reproduce.log", "reproduce.log.creation_time"}:
@@ -54,7 +65,10 @@ for current, directories, files in os.walk(root, followlinks=False):
         with open(path, "rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(chunk)
-        snapshot[relative] = digest.hexdigest()
+        snapshot[relative] = {
+            "sha256": digest.hexdigest(),
+            "mtime_ns": info.st_mtime_ns,
+        }
 with open(output, "w", encoding="utf-8") as handle:
     json.dump(snapshot, handle, sort_keys=True)
 """.strip()
@@ -68,15 +82,25 @@ import stat
 import sys
 
 root, snapshot_path, destination, max_size = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+excluded_directories = {
+    ".cache",
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".venv",
+    "__pycache__",
+    "node_modules",
+    "venv",
+}
 with open(snapshot_path, encoding="utf-8") as handle:
     before = json.load(handle)
 os.makedirs(destination, exist_ok=True)
 for current, directories, files in os.walk(root, followlinks=False):
-    directories[:] = sorted(directories)
+    directories[:] = sorted(name for name in directories if name not in excluded_directories)
     for name in sorted(files):
         path = os.path.join(current, name)
         info = os.lstat(path)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > max_size:
+        if name.endswith(".pyc") or not stat.S_ISREG(info.st_mode) or info.st_size > max_size:
             continue
         relative = os.path.relpath(path, root)
         if relative in {"reproduce.log", "reproduce.log.creation_time"}:
@@ -85,7 +109,11 @@ for current, directories, files in os.walk(root, followlinks=False):
         with open(path, "rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(chunk)
-        if before.get(relative) == digest.hexdigest():
+        fingerprint = {
+            "sha256": digest.hexdigest(),
+            "mtime_ns": info.st_mtime_ns,
+        }
+        if before.get(relative) == fingerprint:
             continue
         target = os.path.join(destination, relative)
         os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -229,6 +257,7 @@ def _build_execution_feedback_driver(*, iteration: int, timeout_seconds: int) ->
             f"feedback_dir={shlex.quote(feedback_dir)}",
             f"harness_dir={shlex.quote(harness_dir)}",
             f"harness_log={shlex.quote(harness_log_path)}",
+            'attempts_dir="$harness_dir/attempts"',
             f"container_prefix={shlex.quote(container_prefix)}",
             'container_name=""',
             (
@@ -240,7 +269,7 @@ def _build_execution_feedback_driver(*, iteration: int, timeout_seconds: int) ->
             'deadline_epoch=$(($(date +%s) + diagnostic_budget_seconds))',
             f"attempt_options=({attempt_options})",
             'rm -rf -- "$feedback_dir" "$harness_dir"',
-            'mkdir -p "$feedback_dir/attempts" "$harness_dir"',
+            'mkdir -p "$feedback_dir" "$attempts_dir"',
             ': > "$harness_log"',
             "gpu_args=()",
             (
@@ -261,7 +290,6 @@ def _build_execution_feedback_driver(*, iteration: int, timeout_seconds: int) ->
             "durations=()",
             "statuses=()",
             "attempt_count=0",
-            "terminal_attempt=-1",
             "for option in \"${attempt_options[@]}\"; do",
             (
                 f"  remaining=$((deadline_epoch - $(date +%s) - "
@@ -271,7 +299,7 @@ def _build_execution_feedback_driver(*, iteration: int, timeout_seconds: int) ->
             '  read -r use_py3_11 make_venv <<< "$option"',
             "  attempt_index=$attempt_count",
             "  attempt_number=$((attempt_index + 1))",
-            '  attempt_dir="$feedback_dir/attempts/attempt-$attempt_number"',
+            '  attempt_dir="$attempts_dir/attempt-$attempt_number"',
             '  container_name="$container_prefix-$attempt_number"',
             '  mkdir -p "$attempt_dir/artifacts"',
             '  started=$SECONDS',
@@ -334,35 +362,41 @@ def _build_execution_feedback_driver(*, iteration: int, timeout_seconds: int) ->
             '  docker rm -f "$container_name" >/dev/null 2>&1 || true',
             (
                 f"  if [[ \"$attempt_status\" == 124 || \"$attempt_status\" == 137 "
-                f"|| \"$duration\" -ge {EXECUTION_FEEDBACK_RETRY_THRESHOLD_SECONDS} ]]; then"
+                f"|| ( \"$attempt_status\" == 0 "
+                f"&& \"$duration\" -ge {EXECUTION_FEEDBACK_RETRY_THRESHOLD_SECONDS} ) ]]; then"
             ),
-            "    terminal_attempt=$attempt_index",
             "    break",
             "  fi",
             "done",
             "if (( attempt_count == 0 )); then",
             f"  exit {EXECUTION_FEEDBACK_INFRASTRUCTURE_EXIT_CODE}",
             "fi",
-            "selected_attempt=$terminal_attempt",
+            "selected_attempt=-1",
+            "for ((index=0; index<attempt_count; index++)); do",
+            "  if (( statuses[index] == 0 )) && {",
+            "    (( selected_attempt < 0 )) || (( durations[index] > durations[selected_attempt] ))",
+            "  }; then",
+            "    selected_attempt=$index",
+            "  fi",
+            "done",
             "if (( selected_attempt < 0 )); then",
             "  selected_attempt=0",
             "  for ((index=1; index<attempt_count; index++)); do",
-            '    if (( durations[index] > durations[selected_attempt] )); then',
+            "    if (( durations[index] > durations[selected_attempt] )); then",
             "      selected_attempt=$index",
             "    fi",
             "  done",
             "fi",
             "selected_number=$((selected_attempt + 1))",
-            (
-                'ln -s "attempts/attempt-$selected_number/reproduce.log" '
-                '"$feedback_dir/reproduce.log"'
-            ),
-            (
-                'ln -s "attempts/attempt-$selected_number/artifacts" '
-                '"$feedback_dir/artifacts"'
-            ),
+            'cp "$attempts_dir/attempt-$selected_number/reproduce.log" '
+            '"$feedback_dir/reproduce.log"',
+            'mkdir -p "$feedback_dir/artifacts"',
+            'cp -a "$attempts_dir/attempt-$selected_number/artifacts/." '
+            '"$feedback_dir/artifacts/"',
+            'selected_status="${statuses[selected_attempt]}"',
+            'rm -rf -- "$harness_dir"',
             'cat "$feedback_dir/reproduce.log"',
-            'exit "${statuses[selected_attempt]}"',
+            'exit "$selected_status"',
         ]
     )
     return f"bash -lc {shlex.quote(driver)}"
