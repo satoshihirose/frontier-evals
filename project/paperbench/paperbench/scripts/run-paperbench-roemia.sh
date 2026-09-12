@@ -219,7 +219,6 @@ agent_env="${PAPERBENCH_AGENT_ENV:-$paperbench_root/paperbench/solvers/agent.env
 cache_dir="$data_root/cache"
 runs_dir="$data_root/runs"
 agent_tmp_dir="$data_root/tmp/agent"
-reproduction_tmp_dir="$data_root/tmp/reproduction"
 auth_runtime_root="$data_root/tmp/codex-auth"
 runtime_codex_home="$auth_runtime_root/dry-run"
 runtime_auth_file="$runtime_codex_home/auth.json"
@@ -457,11 +456,10 @@ else
     "$cache_dir/host-uv" \
     "$runs_dir" \
     "$agent_tmp_dir" \
-    "$reproduction_tmp_dir" \
     "$auth_runtime_root" \
     "$gpu_lock_dir"
   chmod 700 "$data_root" "$cache_dir" "$runs_dir" "$auth_runtime_root" "$gpu_lock_dir"
-  chmod 1777 "$agent_tmp_dir" "$reproduction_tmp_dir"
+  chmod 1777 "$agent_tmp_dir"
   runtime_codex_home="$(mktemp -d "$auth_runtime_root/run.XXXXXX")"
   runtime_auth_file="$runtime_codex_home/auth.json"
   chmod 700 "$runtime_codex_home"
@@ -516,9 +514,6 @@ command=(
   paperbench.reproduction.computer_runtime.env.volumes_config.paperbench_cache.bind_source="$cache_dir"
   paperbench.reproduction.computer_runtime.env.volumes_config.paperbench_cache.bind_dest=/root/.cache
   paperbench.reproduction.computer_runtime.env.volumes_config.paperbench_cache.mode=rw
-  paperbench.reproduction.computer_runtime.env.volumes_config.paperbench_tmp.bind_source="$reproduction_tmp_dir"
-  paperbench.reproduction.computer_runtime.env.volumes_config.paperbench_tmp.bind_dest=/tmp
-  paperbench.reproduction.computer_runtime.env.volumes_config.paperbench_tmp.mode=rw
   paperbench.reproduction.skip_reproduction=False
   paperbench.reproduction.timeout=86400
   paperbench.judge.code_only=False

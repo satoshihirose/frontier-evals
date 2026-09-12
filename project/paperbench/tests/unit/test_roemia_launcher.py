@@ -235,7 +235,7 @@ def test_roemia_launcher_waits_when_selected_gpu_lock_is_contended(
     assert int(lock_attempts.read_text()) >= 2
 
 
-def test_roemia_launcher_externalizes_runs_cache_and_tmp(tmp_path: Path) -> None:
+def test_roemia_launcher_externalizes_runs_cache_and_only_agent_tmp(tmp_path: Path) -> None:
     launcher = get_root() / "scripts" / "run-paperbench-roemia.sh"
     data_root = tmp_path / "paperbench-data"
     auth_file = tmp_path / "auth.json"
@@ -271,9 +271,12 @@ def test_roemia_launcher_externalizes_runs_cache_and_tmp(tmp_path: Path) -> None
         f"bind_source={data_root / 'cache'}"
     ) in command
     assert (
-        "paperbench.reproduction.computer_runtime.env.volumes_config.paperbench_tmp."
-        f"bind_source={data_root / 'tmp' / 'reproduction'}"
+        "paperbench.solver.computer_runtime.env.volumes_config.paperbench_tmp."
+        f"bind_source={data_root / 'tmp' / 'agent'}"
     ) in command
+    assert (
+        "paperbench.reproduction.computer_runtime.env.volumes_config.paperbench_tmp" not in command
+    )
     assert "paperbench.solver.computer_runtime.env.is_nvidia_gpu_env=true" in command
     assert "paperbench.reproduction.computer_runtime.env.is_nvidia_gpu_env=true" in command
     assert (

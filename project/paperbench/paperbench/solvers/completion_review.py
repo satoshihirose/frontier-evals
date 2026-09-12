@@ -182,6 +182,33 @@ def _build_reproduction_container_command() -> str:
     return "\n".join(
         [
             "set -uo pipefail",
+            (
+                "source_staging=$(mktemp -d /tmp/execution-feedback-source.XXXXXX) "
+                f"|| {{ touch {EXECUTION_FEEDBACK_INFRASTRUCTURE_MARKER}; "
+                f"exit {EXECUTION_FEEDBACK_INFRASTRUCTURE_EXIT_CODE}; }}"
+            ),
+            (
+                "tar -xzf /tmp/execution-feedback-submission.tar.gz "
+                ' -C "$source_staging" '
+                f"|| {{ touch {EXECUTION_FEEDBACK_INFRASTRUCTURE_MARKER}; "
+                f"exit {EXECUTION_FEEDBACK_INFRASTRUCTURE_EXIT_CODE}; }}"
+            ),
+            (
+                'test -d "$source_staging/submission" '
+                f"|| {{ touch {EXECUTION_FEEDBACK_INFRASTRUCTURE_MARKER}; "
+                f"exit {EXECUTION_FEEDBACK_INFRASTRUCTURE_EXIT_CODE}; }}"
+            ),
+            (
+                "rm -rf -- /submission "
+                f"|| {{ touch {EXECUTION_FEEDBACK_INFRASTRUCTURE_MARKER}; "
+                f"exit {EXECUTION_FEEDBACK_INFRASTRUCTURE_EXIT_CODE}; }}"
+            ),
+            (
+                'mv "$source_staging/submission" /submission '
+                f"|| {{ touch {EXECUTION_FEEDBACK_INFRASTRUCTURE_MARKER}; "
+                f"exit {EXECUTION_FEEDBACK_INFRASTRUCTURE_EXIT_CODE}; }}"
+            ),
+            'rm -rf -- "$source_staging" /tmp/execution-feedback-submission.tar.gz',
             "cd /submission",
             "rm -rf -- venv .venv",
             "mkdir -p /tmp/execution-feedback-artifacts",
@@ -260,9 +287,12 @@ def _build_execution_feedback_driver(*, iteration: int, timeout_seconds: int) ->
             'attempts_dir="$harness_dir/attempts"',
             f"container_prefix={shlex.quote(container_prefix)}",
             'container_name=""',
+            'normalized_submission_root=""',
             (
                 'cleanup() { if [[ -n "$container_name" ]]; then '
-                'docker rm -f "$container_name" >/dev/null 2>&1 || true; fi; }'
+                'docker rm -f "$container_name" >/dev/null 2>&1 || true; fi; '
+                'if [[ -n "$normalized_submission_root" ]]; then '
+                'rm -rf -- "$normalized_submission_root"; fi; }'
             ),
             "trap cleanup EXIT",
             f"diagnostic_budget_seconds={timeout_seconds}",
@@ -271,6 +301,32 @@ def _build_execution_feedback_driver(*, iteration: int, timeout_seconds: int) ->
             'rm -rf -- "$feedback_dir" "$harness_dir"',
             'mkdir -p "$feedback_dir" "$attempts_dir"',
             ': > "$harness_log"',
+            (
+                "normalized_submission_root=$(mktemp -d "
+                "/tmp/pb-execution-feedback-source.XXXXXX) "
+                f"|| exit {EXECUTION_FEEDBACK_INFRASTRUCTURE_EXIT_CODE}"
+            ),
+            'normalized_submission_staging="$normalized_submission_root/staging"',
+            'normalized_submission_archive="$normalized_submission_root/submission.tar.gz"',
+            'normalized_submission_excludes="$normalized_submission_root/exclude.txt"',
+            'mkdir -p "$normalized_submission_staging"',
+            (
+                f"cp -rp {shlex.quote(SUBMISSION_DIR)} "
+                '"$normalized_submission_staging" >> "$harness_log" 2>&1 '
+                f"|| exit {EXECUTION_FEEDBACK_INFRASTRUCTURE_EXIT_CODE}"
+            ),
+            (
+                'find "$normalized_submission_staging" -type f '
+                "-not -name agent.log -not -name inspect.log -size +10M "
+                "-printf '%P\\n' > \"$normalized_submission_excludes\" "
+                f"|| exit {EXECUTION_FEEDBACK_INFRASTRUCTURE_EXIT_CODE}"
+            ),
+            (
+                'tar -czf "$normalized_submission_archive" '
+                '-X "$normalized_submission_excludes" '
+                '-C "$normalized_submission_staging" . '
+                f"|| exit {EXECUTION_FEEDBACK_INFRASTRUCTURE_EXIT_CODE}"
+            ),
             "assigned_gpu_uuids=()",
             (
                 "while IFS= read -r gpu_uuid; do "
@@ -319,8 +375,9 @@ def _build_execution_feedback_driver(*, iteration: int, timeout_seconds: int) ->
             f"    exit {EXECUTION_FEEDBACK_INFRASTRUCTURE_EXIT_CODE}",
             "  fi",
             (
-                f"  if ! docker cp {shlex.quote(SUBMISSION_DIR)}/. "
-                '"$container_name:/submission" >> "$harness_log" 2>&1; then'
+                '  if ! docker cp "$normalized_submission_archive" '
+                '"$container_name:/tmp/execution-feedback-submission.tar.gz" '
+                '>> "$harness_log" 2>&1; then'
             ),
             '    docker rm -f "$container_name" >/dev/null 2>&1 || true',
             f"    exit {EXECUTION_FEEDBACK_INFRASTRUCTURE_EXIT_CODE}",

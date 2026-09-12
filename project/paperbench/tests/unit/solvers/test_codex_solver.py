@@ -297,8 +297,13 @@ def test_execution_feedback_matches_formal_reproduction_contract() -> None:
     assert "NVIDIA_VISIBLE_DEVICES" not in command
     assert "update-alternatives --set python3 /usr/bin/python3.11" in command
     assert "python3 -m venv venv" in command
+    assert "rm -rf -- venv .venv" in command
     assert command.count("docker create") == 1
     assert "attempt_options=" in command
+    assert "normalized_submission_archive" in command
+    assert "-size +10M" in command
+    assert 'docker cp "$normalized_submission_archive"' in command
+    assert "docker cp /home/submission/." not in command
     assert "600" in command
     assert "reproduce.log" in command
     assert "harness.log" in command
@@ -944,7 +949,8 @@ async def test_codex_solver_counts_execution_feedback_against_shared_budget(
     assert len(diagnostic_commands) == 1
     assert "diagnostic_budget_seconds=3540" in diagnostic_commands[0]
     assert "pb-reproducer:latest" in diagnostic_commands[0]
-    assert "docker cp /home/submission/." in diagnostic_commands[0]
+    assert 'docker cp "$normalized_submission_archive"' in diagnostic_commands[0]
+    assert "docker cp /home/submission/." not in diagnostic_commands[0]
     assert "--shm-size 8g" in diagnostic_commands[0]
     assert "nvidia-smi --query-gpu=uuid --format=csv,noheader" in diagnostic_commands[0]
     assert 'gpu_args=(--gpus "device=${assigned_gpu_uuids[0]}")' in diagnostic_commands[0]
