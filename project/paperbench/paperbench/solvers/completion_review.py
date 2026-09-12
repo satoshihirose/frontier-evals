@@ -308,7 +308,7 @@ def _build_execution_feedback_driver(*, iteration: int, timeout_seconds: int) ->
             "  started=$SECONDS",
             '  docker rm -f "$container_name" >/dev/null 2>&1 || true',
             (
-                '  if ! docker create --name "$container_name" --shm-size 8g '
+                '  if ! docker create --name "$container_name" --runtime nvidia --shm-size 8g '
                 f"--network {shlex.quote(EXECUTION_FEEDBACK_NETWORK)} "
                 '"${gpu_args[@]}" "${env_args[@]}" '
                 '-e "PB_USE_PY3_11=$use_py3_11" -e "PB_MAKE_VENV=$make_venv" '

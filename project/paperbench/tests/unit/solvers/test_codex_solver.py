@@ -289,6 +289,7 @@ def test_execution_feedback_matches_formal_reproduction_contract() -> None:
 
     assert "--env-file /home/agent.env" in command
     assert "--network bridge" in command
+    assert "--runtime nvidia" in command
     assert "nvidia-smi --query-gpu=uuid --format=csv,noheader" in command
     assert "assigned_gpu_uuids" in command
     assert 'gpu_args=(--gpus "device=${assigned_gpu_uuids[0]}")' in command
