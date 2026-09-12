@@ -198,7 +198,7 @@ def _build_reproduction_container_command() -> str:
             (
                 'if [[ "$setup_status" != 0 ]]; then '
                 "tar -czf /tmp/execution-feedback-artifacts.tar.gz "
-                "-C /tmp/execution-feedback-artifacts .; exit \"$setup_status\"; fi"
+                '-C /tmp/execution-feedback-artifacts .; exit "$setup_status"; fi'
             ),
             (
                 f"python3 -c {shlex.quote(_SNAPSHOT_SCRIPT)} /submission "
@@ -266,22 +266,25 @@ def _build_execution_feedback_driver(*, iteration: int, timeout_seconds: int) ->
             ),
             "trap cleanup EXIT",
             f"diagnostic_budget_seconds={timeout_seconds}",
-            'deadline_epoch=$(($(date +%s) + diagnostic_budget_seconds))',
+            "deadline_epoch=$(($(date +%s) + diagnostic_budget_seconds))",
             f"attempt_options=({attempt_options})",
             'rm -rf -- "$feedback_dir" "$harness_dir"',
             'mkdir -p "$feedback_dir" "$attempts_dir"',
             ': > "$harness_log"',
-            "gpu_args=()",
+            "assigned_gpu_uuids=()",
             (
-                'if [[ -n "${NVIDIA_VISIBLE_DEVICES:-}" '
-                '&& "${NVIDIA_VISIBLE_DEVICES:-}" != void ]]; then'
+                "while IFS= read -r gpu_uuid; do "
+                '[[ -n "$gpu_uuid" ]] && assigned_gpu_uuids+=("$gpu_uuid"); '
+                'done < <(nvidia-smi --query-gpu=uuid --format=csv,noheader 2>>"$harness_log")'
             ),
-            '  if [[ "${NVIDIA_VISIBLE_DEVICES}" == all ]]; then',
-            "    gpu_args=(--gpus all)",
-            "  else",
-            '    gpu_args=(--gpus "device=${NVIDIA_VISIBLE_DEVICES}")',
-            "  fi",
+            "if (( ${#assigned_gpu_uuids[@]} != 1 )); then",
+            (
+                "  printf 'Expected exactly one GPU in the Agent container; found %s.\\n' "
+                '"${#assigned_gpu_uuids[@]}" >> "$harness_log"'
+            ),
+            f"  exit {EXECUTION_FEEDBACK_INFRASTRUCTURE_EXIT_CODE}",
             "fi",
+            'gpu_args=(--gpus "device=${assigned_gpu_uuids[0]}")',
             "env_args=()",
             (
                 f"if [[ -f {shlex.quote(EXECUTION_FEEDBACK_ENV_FILE)} ]]; then "
@@ -290,7 +293,7 @@ def _build_execution_feedback_driver(*, iteration: int, timeout_seconds: int) ->
             "durations=()",
             "statuses=()",
             "attempt_count=0",
-            "for option in \"${attempt_options[@]}\"; do",
+            'for option in "${attempt_options[@]}"; do',
             (
                 f"  remaining=$((deadline_epoch - $(date +%s) - "
                 f"{EXECUTION_FEEDBACK_ARTIFACT_RESERVE_SECONDS}))"
@@ -302,7 +305,7 @@ def _build_execution_feedback_driver(*, iteration: int, timeout_seconds: int) ->
             '  attempt_dir="$attempts_dir/attempt-$attempt_number"',
             '  container_name="$container_prefix-$attempt_number"',
             '  mkdir -p "$attempt_dir/artifacts"',
-            '  started=$SECONDS',
+            "  started=$SECONDS",
             '  docker rm -f "$container_name" >/dev/null 2>&1 || true',
             (
                 '  if ! docker create --name "$container_name" --shm-size 8g '
@@ -311,7 +314,7 @@ def _build_execution_feedback_driver(*, iteration: int, timeout_seconds: int) ->
                 '-e "PB_USE_PY3_11=$use_py3_11" -e "PB_MAKE_VENV=$make_venv" '
                 '-e "PB_DIAGNOSTIC_DEADLINE=$deadline_epoch" '
                 f"{shlex.quote(EXECUTION_FEEDBACK_IMAGE)} bash -lc "
-                f"{shlex.quote(container_command)} >> \"$harness_log\" 2>&1; then"
+                f'{shlex.quote(container_command)} >> "$harness_log" 2>&1; then'
             ),
             f"    exit {EXECUTION_FEEDBACK_INFRASTRUCTURE_EXIT_CODE}",
             "  fi",
@@ -337,7 +340,7 @@ def _build_execution_feedback_driver(*, iteration: int, timeout_seconds: int) ->
             '  statuses+=("$attempt_status")',
             "  attempt_count=$((attempt_count + 1))",
             (
-                f"  if docker cp \"$container_name:{EXECUTION_FEEDBACK_INFRASTRUCTURE_MARKER}\" "
+                f'  if docker cp "$container_name:{EXECUTION_FEEDBACK_INFRASTRUCTURE_MARKER}" '
                 '"$harness_dir/infrastructure-error" >> "$harness_log" 2>&1; then'
             ),
             '    docker rm -f "$container_name" >/dev/null 2>&1 || true',
@@ -361,9 +364,9 @@ def _build_execution_feedback_driver(*, iteration: int, timeout_seconds: int) ->
             '  rm -f -- "$attempt_dir/artifacts.tar.gz"',
             '  docker rm -f "$container_name" >/dev/null 2>&1 || true',
             (
-                f"  if [[ \"$attempt_status\" == 124 || \"$attempt_status\" == 137 "
-                f"|| ( \"$attempt_status\" == 0 "
-                f"&& \"$duration\" -ge {EXECUTION_FEEDBACK_RETRY_THRESHOLD_SECONDS} ) ]]; then"
+                f'  if [[ "$attempt_status" == 124 || "$attempt_status" == 137 '
+                f'|| ( "$attempt_status" == 0 '
+                f'&& "$duration" -ge {EXECUTION_FEEDBACK_RETRY_THRESHOLD_SECONDS} ) ]]; then'
             ),
             "    break",
             "  fi",
@@ -391,8 +394,7 @@ def _build_execution_feedback_driver(*, iteration: int, timeout_seconds: int) ->
             'cp "$attempts_dir/attempt-$selected_number/reproduce.log" '
             '"$feedback_dir/reproduce.log"',
             'mkdir -p "$feedback_dir/artifacts"',
-            'cp -a "$attempts_dir/attempt-$selected_number/artifacts/." '
-            '"$feedback_dir/artifacts/"',
+            'cp -a "$attempts_dir/attempt-$selected_number/artifacts/." "$feedback_dir/artifacts/"',
             'selected_status="${statuses[selected_attempt]}"',
             'rm -rf -- "$harness_dir"',
             'cat "$feedback_dir/reproduce.log"',

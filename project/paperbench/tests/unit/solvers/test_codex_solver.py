@@ -289,6 +289,11 @@ def test_execution_feedback_matches_formal_reproduction_contract() -> None:
 
     assert "--env-file /home/agent.env" in command
     assert "--network bridge" in command
+    assert "nvidia-smi --query-gpu=uuid --format=csv,noheader" in command
+    assert "assigned_gpu_uuids" in command
+    assert 'gpu_args=(--gpus "device=${assigned_gpu_uuids[0]}")' in command
+    assert "if (( ${#assigned_gpu_uuids[@]} != 1 )); then" in command
+    assert "NVIDIA_VISIBLE_DEVICES" not in command
     assert "update-alternatives --set python3 /usr/bin/python3.11" in command
     assert "python3 -m venv venv" in command
     assert command.count("docker create") == 1
@@ -302,7 +307,7 @@ def test_execution_feedback_matches_formal_reproduction_contract() -> None:
     assert 'mkdir -p "$feedback_dir" "$attempts_dir"' in command
     assert 'rm -rf -- "$harness_dir"' in command
     assert '"$attempt_status" == 0' in command
-    assert 'statuses[index] == 0' in command
+    assert "statuses[index] == 0" in command
     assert 'ln -s "attempts/' not in command
 
 
@@ -565,7 +570,7 @@ async def test_codex_child_marks_timed_out_fork_review_as_performed(
     session_checkpoint.write_bytes(b"session")
     source_submission.write_bytes(b"submission")
     computer = FakeComputer(
-        review_event_log=b'\n'.join(
+        review_event_log=b"\n".join(
             [
                 b'{"type":"thread.started","thread_id":"branch-456"}',
                 b'{"type":"item.completed","item":{"type":"agent_message"}}',
@@ -940,8 +945,8 @@ async def test_codex_solver_counts_execution_feedback_against_shared_budget(
     assert "pb-reproducer:latest" in diagnostic_commands[0]
     assert "docker cp /home/submission/." in diagnostic_commands[0]
     assert "--shm-size 8g" in diagnostic_commands[0]
-    assert 'NVIDIA_VISIBLE_DEVICES}" == all' in diagnostic_commands[0]
-    assert "gpu_args=(--gpus all)" in diagnostic_commands[0]
+    assert "nvidia-smi --query-gpu=uuid --format=csv,noheader" in diagnostic_commands[0]
+    assert 'gpu_args=(--gpus "device=${assigned_gpu_uuids[0]}")' in diagnostic_commands[0]
     review_commands = [command for command in computer.commands if "codex exec resume" in command]
     assert len(review_commands) == 1
     assert "/home/logs/execution-feedback/iteration-1/reproduce.log" in review_commands[0]
