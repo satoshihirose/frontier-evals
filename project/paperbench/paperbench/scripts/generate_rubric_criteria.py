@@ -13,6 +13,7 @@ from paperbench.evaluation_specification import (
     flatten_rubric_criteria,
 )
 from paperbench.paper_registry import paper_registry
+from paperbench.utils import load_yaml_dict
 
 MANIFEST_FILENAME = RUBRIC_CRITERIA_MANIFEST_FILENAME
 
@@ -42,7 +43,14 @@ def _build_all(
         raise ValueError(f"No registered papers found under {papers_dir}")
 
     for paper_dir in paper_directories:
-        paper_id = paper_dir.name
+        config = load_yaml_dict(paper_dir / "config.yaml")
+        paper_id = config.get("id")
+        if not isinstance(paper_id, str) or not paper_id:
+            raise ValueError(
+                f"Cannot generate rubric criteria for {paper_dir.name}: invalid paper id"
+            )
+        if paper_id in manifest_entries:
+            raise ValueError(f"Duplicate paper id in registry: {paper_id}")
         rubric_path = paper_dir / "rubric.json"
         try:
             rubric_content = rubric_path.read_bytes()
@@ -95,6 +103,10 @@ def generate_all_rubric_criteria(
         for destination in artifacts:
             os.replace(destination.with_name(f".{destination.name}.tmp"), destination)
         os.replace(temporary_manifest, manifest_path)
+        expected_paths = set(artifacts) | {manifest_path}
+        for stale_path in resolved_artifact_dir.glob("*.json"):
+            if stale_path not in expected_paths:
+                stale_path.unlink()
     finally:
         for temporary in temporary_paths:
             temporary.unlink(missing_ok=True)
@@ -119,6 +131,16 @@ def verify_all_rubric_criteria(
                 "regenerate all rubric criteria with "
                 "`python -m paperbench.scripts.generate_rubric_criteria`"
             )
+    expected_paths = set(expected_artifacts) | {manifest_path}
+    unexpected_paths = sorted(
+        path for path in resolved_artifact_dir.glob("*.json") if path not in expected_paths
+    )
+    if unexpected_paths:
+        names = ", ".join(path.name for path in unexpected_paths)
+        raise ValueError(
+            f"Unexpected rubric criteria artifacts found: {names}; regenerate all rubric "
+            "criteria with `python -m paperbench.scripts.generate_rubric_criteria`"
+        )
     return result
 
 

@@ -13,8 +13,14 @@ from paperbench.scripts.generate_rubric_criteria import (
 )
 
 
-def _write_paper(papers_dir: Path, paper_id: str, requirement: str) -> None:
-    paper_dir = papers_dir / paper_id
+def _write_paper(
+    papers_dir: Path,
+    paper_id: str,
+    requirement: str,
+    *,
+    directory_name: str | None = None,
+) -> None:
+    paper_dir = papers_dir / (directory_name or paper_id)
     paper_dir.mkdir(parents=True)
     (paper_dir / "config.yaml").write_text(f'id: {paper_id}\ntitle: "{paper_id}"\n')
     (paper_dir / "rubric.json").write_text(
@@ -37,13 +43,39 @@ def test_generate_and_verify_all_registered_papers(tmp_path: Path) -> None:
     result = generate_all_rubric_criteria(papers_dir, artifact_dir)
 
     assert result.paper_count == 2
-    assert json.loads((artifact_dir / "paper-a.json").read_text()) == [
-        "Criterion A"
-    ]
+    assert json.loads((artifact_dir / "paper-a.json").read_text()) == ["Criterion A"]
     manifest = json.loads((artifact_dir / MANIFEST_FILENAME).read_text())
     assert sorted(manifest["papers"]) == ["paper-a", "paper-b"]
     assert manifest["papers"]["paper-a"]["criterion_count"] == 1
     verify_all_rubric_criteria(papers_dir, artifact_dir)
+
+
+def test_generation_uses_runtime_paper_id_and_removes_stale_slug_artifact(
+    tmp_path: Path,
+) -> None:
+    papers_dir = tmp_path / "papers"
+    artifact_dir = tmp_path / "rubric-criteria"
+    _write_paper(
+        papers_dir,
+        "stochastic-interpolant",
+        "Criterion",
+        directory_name="stochastic-interpolants",
+    )
+    stale_artifact = artifact_dir / "stochastic-interpolants.json"
+    artifact_dir.mkdir(parents=True)
+    stale_artifact.write_text("[]\n")
+
+    generate_all_rubric_criteria(papers_dir, artifact_dir)
+
+    assert (artifact_dir / "stochastic-interpolant.json").is_file()
+    assert not stale_artifact.exists()
+    manifest = json.loads((artifact_dir / MANIFEST_FILENAME).read_text())
+    assert list(manifest["papers"]) == ["stochastic-interpolant"]
+    verify_all_rubric_criteria(papers_dir, artifact_dir)
+
+    stale_artifact.write_text("[]\n")
+    with pytest.raises(ValueError, match="Unexpected rubric criteria artifacts"):
+        verify_all_rubric_criteria(papers_dir, artifact_dir)
 
 
 def test_invalid_source_does_not_partially_replace_existing_artifacts(tmp_path: Path) -> None:
@@ -83,9 +115,7 @@ def test_stale_artifact_requires_full_regeneration(tmp_path: Path) -> None:
 
     generate_all_rubric_criteria(papers_dir, artifact_dir)
     verify_all_rubric_criteria(papers_dir, artifact_dir)
-    assert json.loads((artifact_dir / "paper-a.json").read_text()) == [
-        "New criterion"
-    ]
+    assert json.loads((artifact_dir / "paper-a.json").read_text()) == ["New criterion"]
 
 
 def test_runtime_loader_rejects_artifact_not_recorded_by_manifest(tmp_path: Path) -> None:

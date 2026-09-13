@@ -101,7 +101,7 @@
       "rubric_criteria_sha256": "de09192ff3ef0199a0ef7140fd4bfe3c16b2b706b14e71de02cd9cb97848f0b8",
       "criterion_count": 121
     },
-    "stochastic-interpolants": {
+    "stochastic-interpolant": {
       "rubric_sha256": "f1a4d5d59d8a8eb5fe38ac0df32b2b55351e26ea281f465ebcedd4f53544c97d",
       "rubric_criteria_sha256": "46dc6c2e28c0b376d5b42f9d6c4c2f2e2c1bd072922c5133272ad3115369435f",
       "criterion_count": 69
